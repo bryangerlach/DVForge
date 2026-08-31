@@ -16,6 +16,7 @@ useful to preview a build, or to inspect it on a machine without the toolchains.
 
 import glob as _glob
 import json
+import io
 import os
 import re
 import shutil
@@ -25,6 +26,8 @@ import threading
 import time
 import zipfile
 import platform as _platform
+import urllib.error
+import urllib.request
 
 from . import customize, detect, prereqs, signing, toolchains
 
@@ -3719,20 +3722,43 @@ class Build:
     def _sign_windows_binaries(self, release):
         if not os.path.isdir(release):
             return
-        want = {(self._output_basename() + ".exe").lower(), "rustdesk.exe"}
-        for name in os.listdir(release):
-            if name.lower() in want:
-                self._sign_windows_file(os.path.join(release, name))
+        # Target all .exe and .dll files in the release folder
+        targets = [
+            os.path.join(release, name)
+            for name in os.listdir(release)
+            if name.lower().endswith((".exe", ".dll"))
+            and os.path.isfile(os.path.join(release, name))
+        ]
+        if not targets:
+            return
+
+        # If remote API is configured via env (or config), batch binaries in one request
+        api_url, api_key = self._get_sign_api_config()
+        if api_url and api_key:
+            if self._sign_windows_via_api(targets, api_url, api_key):
+                return
+
+        # Fallback to local signing
+        for path in targets:
+            self._sign_windows_file(path)
 
     def _sign_windows_file(self, path):
-        """Authenticode-sign one .exe/.msi with the configured PFX, or skip."""
+        """Authenticode-sign one .exe/.msi via API or local PFX."""
+        if not path or not os.path.isfile(path):
+            return
+
+        # Check for remote API signing first
+        api_url, api_key = self._get_sign_api_config()
+        if api_url and api_key:
+            if self._sign_windows_via_api([path], api_url, api_key):
+                return
+
+        # Local PFX signing fallback
         pfx = self._cfg_file("signWinPfx")
         if not pfx:
             return
         if self.dry_run:
             self.log(f"  (would signtool {os.path.basename(path)})")
-            return
-        if not path or not os.path.isfile(path):
             return
         signtool = self._find_signtool()
         if not signtool:
@@ -3745,7 +3771,8 @@ class Build:
         cmd = [signtool, "sign", "/fd", "SHA256", "/td", "SHA256",
                "/tr", ts, "/f", pfx, "/p", password, path]
         logged = list(cmd)
-        logged[logged.index("/p") + 1] = "***"
+        if "/p" in logged:
+            logged[logged.index("/p") + 1] = "***"
         self.log(f"  · Authenticode {os.path.basename(path)}")
         rc = self.run(cmd, check=False, log_as=" ".join(logged))
         if rc == 0:
@@ -3753,6 +3780,108 @@ class Build:
         else:
             self.log(f"  ! signtool failed (exit {rc}) — "
                      f"{os.path.basename(path)} is unsigned")
+
+    def _get_sign_api_config(self):
+        """Retrieve signing API URL and Key from environment variables (fallback to config)."""
+        url = (
+            os.environ.get("SIGN_API_URL")
+            or self.config.get("signApiUrl")
+            or ""
+        ).strip()
+
+        key = (
+            os.environ.get("SIGN_API_KEY")
+            or self.config.get("signApiKey")
+            or ""
+        ).strip()
+
+        return url, key
+
+    def _sign_windows_via_api(self, file_paths, api_url, api_key):
+        """Zip files, POST to signing API (https://github.com/bryangerlach/signing_api), receive signed zip, and overwrite originals."""
+        file_paths = [p for p in file_paths if os.path.isfile(p)]
+        if not file_paths:
+            return True
+
+        if self.dry_run:
+            for p in file_paths:
+                self.log(f"  (would remote sign {os.path.basename(p)})")
+            return True
+
+        timeout = int(
+            os.environ.get("SIGN_API_TIMEOUT")
+            or self.config.get("signApiTimeout")
+            or 900
+        )
+
+        self.log(f"  · Archiving {len(file_paths)} file(s) for remote signing...")
+
+        # 1. Zip files in memory
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in file_paths:
+                zf.write(p, arcname=os.path.basename(p))
+
+        # 2. Build multipart payload
+        boundary = "----SigningBoundary" + os.urandom(16).hex()
+        body = io.BytesIO()
+        body.write(f"--{boundary}\r\n".encode("utf-8"))
+        body.write(b'Content-Disposition: form-data; name="file"; filename="unsigned_files.zip"\r\n')
+        body.write(b"Content-Type: application/zip\r\n\r\n")
+        body.write(zip_buf.getvalue())
+        body.write(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        payload = body.getvalue()
+
+        req = urllib.request.Request(
+            url=api_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "X-API-KEY": api_key,
+                "Content-Length": str(len(payload)),
+            },
+        )
+
+        # 3. Post to API and overwrite target files
+        label = os.path.basename(file_paths[0]) if len(file_paths) == 1 else f"{len(file_paths)} files"
+        
+        # Log safe target name (masks custom paths or credentials in the URL)
+        try:
+            parsed = urllib.parse.urlparse(api_url)
+            safe_target = parsed.netloc or "remote host"
+        except Exception:
+            safe_target = "remote host"
+
+        self.log(f"  · Uploading {label} to signing service ({safe_target})...")
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    self.log(f"  ! Signing server error: HTTP {resp.status}")
+                    return False
+                resp_bytes = resp.read()
+
+            with zipfile.ZipFile(io.BytesIO(resp_bytes)) as resp_zf:
+                target_map = {os.path.basename(p).lower(): p for p in file_paths}
+                for member in resp_zf.infolist():
+                    name = os.path.basename(member.filename).lower()
+                    if name in target_map:
+                        dest_path = target_map[name]
+                        with resp_zf.open(member) as src, open(dest_path, "wb") as dst:
+                            dst.write(src.read())
+                        self.log(f"  ✓ signed {os.path.basename(dest_path)}")
+            return True
+
+        except urllib.error.HTTPError as e:
+            self.log(f"  ! Remote signing HTTP error: {e.code} ({e.reason})")
+            return False
+        except urllib.error.URLError as e:
+            self.log(f"  ! Remote signing network error: {e.reason}")
+            return False
+        except Exception as e:
+            self.log(f"  ! Remote signing failed: {type(e).__name__}")
+            return False
 
     def _write_android_key_properties(self):
         """Write flutter/android/key.properties for release signing.
