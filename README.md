@@ -559,6 +559,10 @@ Two transports are supported:
 
 **Worker rating:** new machines start at 50%. Higher-rated idle workers of the same OS get jobs first. A worker with zero successes after 2+ jobs, or 5 failures in a row, is skipped until reset. You can **pin** a specific machine for a job.
 
+**Offline alerts:** pass `--notification-webhook <url>` (or `DVFORGE_WORKER_WEBHOOK`) to a worker and the queue will POST to that URL when the worker drops offline or recovers — useful for a Discord/Slack channel. See `farm/README.md` § 3d.
+
+**Stopping :8765 / :8766:** `--with-app` / `--with-queue` intentionally leave those running after Ctrl+C so other machines keep claiming. Run `./farm/stop-farm.sh` (`farm\stop-farm.bat` on Windows) to stop both and clean up stale worker locks.
+
 > 🔒 **Security:** never expose port 8766 or DVForge's `:8765` to the public internet without nginx HTTPS + a token. Prefer blocking `/api/build/` on any public vhost and letting the queue be the only public entry. **One job = one OS.**
 
 Full walk-through (both PCs, NAS mounts, nginx, curl recipes, worker reset/pin): **[`farm/README.md`](farm/README.md)**.
@@ -637,6 +641,7 @@ DVForge/
 │   ├── worker.py                #   claims + builds jobs matching its OS
 │   ├── queue.py                 #   HTTP job queue (run behind nginx + token)
 │   ├── submit.py                #   submit a job
+│   ├── stop-farm.sh / .bat      #   stop :8765 / :8766 + clean worker locks
 │   ├── inbox/ outbox/ failed/ … #   job flow directories
 │   ├── public/                  #   public submit UI (index/join/stats)
 │   └── README.md                #   full farm guide

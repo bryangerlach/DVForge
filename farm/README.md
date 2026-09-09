@@ -116,9 +116,57 @@ cd /path/to/DVForge/farm
 python3 worker.py --with-app --queue "https://api.nas86.eu" --token "testingfase"
 ```
 
-`--with-app` starts `python3 app.py --no-browser` if `127.0.0.1:8765` is not already up. `--with-queue` starts `queue.py` on `:8766` if the farm API is down (Mac host only). Ctrl+C stops the worker and the DVForge it started; the farm API is left running so other PCs keep claiming.
+`--with-app` starts `python3 app.py --no-browser` if `127.0.0.1:8765` is not already up. `--with-queue` starts `queue.py` on `:8766` if the farm API is down (Mac host only). Ctrl+C stops the worker and the DVForge it started; **the farm API is deliberately left running** so other PCs keep claiming — it is not tied to any one worker's lifetime.
+
+The worker refuses to start a second time under the same name on the same machine (checked via a local PID lock keyed on `DVFORGE_WORKER` / the hostname). Two workers sharing a name would both keep pinging `/claim`, hiding real outages from the queue's offline detection and `--notification-webhook` alerts below. If you see "Another worker named '...' is already running", find and stop the old process, or set `DVFORGE_WORKER=<unique-name>` to intentionally run a second one.
 
 Copy the latest `farm/worker.py` onto that machine if it is an older clone. Restart `queue.py` so `/claim` exists. Bump nginx `client_max_body_size` to `80m` (see `nginx-api.nas86.eu.conf`) so `.dmg` uploads succeed.
+
+**Stopping everything cleanly:** `--with-app` / `--with-queue` deliberately leave `app.py` (:8765) and `queue.py` (:8766) running after Ctrl+C, so other machines keep claiming. When you actually want them gone — e.g. before a clean `--notification-webhook` test, or to free the ports for a restart — use:
+
+```bash
+./farm/stop-farm.sh            # stops :8765 and :8766, graceful then force after 5s
+./farm/stop-farm.sh 8766       # stop only the queue
+./farm/stop-farm.sh --force    # kill -9 immediately, no grace period
+```
+
+```bat
+farm\stop-farm.bat             REM Windows: same, via netstat + taskkill
+```
+
+Both also delete any stale `farm/.worker-*.lock` files left behind.
+
+### 3d. Worker offline alerts (`--notification-webhook`)
+
+Each worker can register a webhook URL at startup so the queue notifies you when it drops offline or recovers. The queue runs a background monitor that watches every worker's `last_seen` timestamp against the 45s online window (`ONLINE_SEC`); when a worker with a registered webhook crosses that threshold, an alert is POSTed to its webhook, and a recovery ping is sent when it checks back in.
+
+Pass the webhook on the worker command line (or via the `DVFORGE_WORKER_WEBHOOK` env var):
+
+```bash
+python3 farm/worker.py --with-app \
+  --queue "https://api.nas86.eu" --token "testingfase" \
+  --notification-webhook "https://discord.com/api/webhooks/..."
+```
+
+The alert payload includes `content` (a human-readable message, rendered by Discord/Slack) plus structured fields (`event`, `worker`, `os`, `busy`, `current_job`, `last_seen_sec`, `at`) that other receivers can parse. Example offline alert:
+
+```json
+{
+  "content": "DVForge worker OFFLINE: mac-mini (last seen 46s ago, was busy, job: 20260909-120530-ab12cd34)",
+  "event": "worker_offline",
+  "worker": "mac-mini",
+  "os": "Darwin",
+  "busy": true,
+  "current_job": "20260909-120530-ab12cd34",
+  "last_seen_sec": 46,
+  "at": "2026-09-09T12:06:16"
+}
+```
+
+Notes:
+- The webhook registration lives in memory on the queue and is re-sent on every `/claim` and `/progress` ping, so a `queue.py` restart self-heals within one poll interval.
+- Webhook POSTs are fire-and-forget with a 10s timeout; a bad URL is logged to stderr and never blocks the monitor or the request handlers.
+- Registration is gated by the queue's existing token auth — untrusted callers can't register arbitrary webhook URLs on an exposed queue.
 
 ## 4. Submit jobs (from either PC)
 

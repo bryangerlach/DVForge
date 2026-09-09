@@ -52,8 +52,73 @@ def log(msg):
     print(time.strftime("%H:%M:%S"), "[%s]" % WORKER_NAME, msg, flush=True)
 
 
+def _lock_path():
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in WORKER_NAME)
+    return os.path.join(HERE, ".worker-%s.lock" % safe)
+
+
+def _pid_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return True  # fail open — never block a legit run because we couldn't check
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours
+    except OSError:
+        return False
+    return True
+
+
+def acquire_lock():
+    """Refuse to start a second worker under the same name on this machine.
+
+    Two workers sharing a name confuse the queue's offline-detection: both
+    keep pinging /claim, so it never sees a real gap and never fires the
+    --notification-webhook alert. Set DVFORGE_WORKER to a unique name if you
+    intentionally want two processes here.
+    """
+    path = _lock_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                old_pid = int((f.read() or "0").strip())
+        except Exception:
+            old_pid = 0
+        if _pid_alive(old_pid):
+            sys.exit(
+                "Another worker named '%s' is already running (pid %s) on this machine.\n"
+                "Stop it first (or set DVFORGE_WORKER=<unique-name> to run a second one) —\n"
+                "two workers with the same name defeat offline/--notification-webhook alerts."
+                % (WORKER_NAME, old_pid))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    return path
+
+
+def release_lock(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            if int((f.read() or "0").strip()) == os.getpid():
+                os.remove(path)
+    except Exception:
+        pass
+
+
 QUEUE_BASE = None
 QUEUE_TOKEN = ""
+WEBHOOK = ""  # per-worker alert destination, set from --notification-webhook
 
 
 def _qheaders(extra=None):
@@ -94,11 +159,15 @@ def http_json(url, data=None, method=None, timeout=30, headers=None):
 
 
 def claim_http():
-    r = http_json(QUEUE_BASE + "/claim", data={
+    payload = {
         "os": HOST,
         "worker": WORKER_NAME,
         "android": CLAIM_ANDROID_ON_MAC,
-    }, headers=_qheaders(), timeout=60)
+    }
+    if WEBHOOK:
+        payload["webhook"] = WEBHOOK
+    r = http_json(QUEUE_BASE + "/claim", data=payload,
+                  headers=_qheaders(), timeout=60)
     job = (r or {}).get("job")
     if not job:
         return None
@@ -187,6 +256,8 @@ def write_progress(job, d, **extra):
         "targets": job.get("targets") or [],
         "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if WEBHOOK:
+        rec["webhook"] = WEBHOOK
     rec.update(extra)
     path = os.path.join(d["running"], jid + ".progress.json")
     tmp = path + ".tmp"
@@ -661,10 +732,16 @@ def main():
                    help="Start app.py --no-browser if localhost DVForge is not up")
     p.add_argument("--with-queue", action="store_true",
                    help="Start queue.py on :8766 if the farm API is not up (Mac host)")
+    p.add_argument("--notification-webhook",
+                   default=os.environ.get("DVFORGE_WORKER_WEBHOOK", ""),
+                   help="URL to notify when this worker goes offline/recovers "
+                        "(env: DVFORGE_WORKER_WEBHOOK)")
     args = p.parse_args()
     CLAIM_ANDROID_ON_MAC = bool(args.android)
     QUEUE_TOKEN = (args.token or "").strip()
     QUEUE_BASE = (args.queue or "").strip().rstrip("/") or None
+    global WEBHOOK
+    WEBHOOK = (args.notification_webhook or "").strip()
     if QUEUE_BASE and ("%" in QUEUE_BASE or QUEUE_BASE.startswith("$")):
         sys.exit(
             "queue URL was not expanded: %s\n"
@@ -673,6 +750,7 @@ def main():
             % QUEUE_BASE)
     farm = os.path.abspath(args.farm)
     url = args.url.rstrip("/")
+    lock_path = acquire_lock()
     if args.with_queue:
         if queue_up():
             log("farm API already running on :%s" % queue_listen()[1])
@@ -698,6 +776,7 @@ def main():
         log("stop")
     finally:
         stop_app(app_proc)
+        release_lock(lock_path)
 
 
 if __name__ == "__main__":
