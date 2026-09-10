@@ -69,26 +69,27 @@ dir_exists() { [ -d "$1" ]; }
 sudo -v
 trap 'sudo -k' EXIT
 
-# 1. dnf update
+# dnf update
 log "Updating system packages"
 sudo dnf check-update -y || true
 sudo dnf upgrade -y
 ok "Packages updated"
 
-# 2. Install build dependencies
+# Install build dependencies
 log "Installing build dependencies"
 DEPS=(
-    gcc gcc-c++ make git python3 python3-pip curl wget unzip zip tar
+    gcc gcc-c++ make git python3 python3-pip python3-devel curl wget unzip zip tar
     pkgconf-pkg-config openssl-devel sqlite-devel clang-devel llvm-devel
     cmake ninja-build file
     rpm-build ImageMagick bsdtar
+    libzstd-devel
     # Multi-arch / 32-bit compatibility libraries (for Android SDK tools & builds)
-    glibc.i686 libstdc++.i686 zlib.i686
+    glibc.i686 libstdc++.i686 zlib-ng.i686
     # RustDesk Linux vcpkg + desktop packaging deps
     nasm yasm
     autoconf automake libtool
     pam-devel
-    gtk3-devel libayatana-appindicator-gtk3-devel libxcb-devel libXdo-devel
+    gtk3-devel libayatana-appindicator-gtk3-devel libxcb-devel libxdo-devel
     alsa-lib-devel pulseaudio-libs-devel gstreamer1-devel gstreamer1-plugins-base-devel
     libva-devel patchelf
     libffi-devel potrace
@@ -124,7 +125,7 @@ if have magick || have convert; then ok "ImageMagick present"; else warn "ImageM
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 
-# 3. Optional Virtual Environment & AppImage Packaging Setup
+# Optional Virtual Environment & AppImage Packaging Setup
 if [ "$INSTALL_APPIMAGE_DEPS" = true ]; then
     log "Setting up Python virtual environment & AppImage dependencies (--appimage enabled)"
 
@@ -195,7 +196,7 @@ else
     skip "Virtual environment and pip packages (--appimage omitted)"
 fi
 
-# 4. Optional Toolchains Bootstrap
+# Optional Toolchains Bootstrap
 if [ "$INSTALL_TOOLCHAINS" = true ]; then
     log "Bootstrapping toolchains"
 
