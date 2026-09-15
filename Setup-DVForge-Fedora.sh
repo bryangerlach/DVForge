@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 # Setup-DVForge-Fedora.sh
 # Sets up a native Linux build environment for DVForge on Fedora (Linux/Android).
+# Automatically uses a Fedora 41 Toolbox container on Fedora 43+ to avoid GCC 16 C++ header mismatches,
+# unless overridden with --no-toolbox or forced with --toolbox.
 #
 # Idempotent — safe to re-run.
 #
-# Installs / verifies:
-#   - Installs build dependencies using DNF
-#   - Configures Fedora TLS CA bundle compatibility for older Flutter/Dart tooling
-#   - Optionally installs AppImage packaging dependencies using pip
-#   - Installs toolchains into .toolchains folder and sets env.json file
-#
 # Usage:
-#   ./Setup-DVForge-Fedora.sh --appimage         # Create Python venv and install packaging dependencies (appimage-builder).
-#   ./Setup-DVForge-Fedora.sh --skip-toolchains  # Skip toolchain bootstrap (Rust, Java, Android SDK/NDK, Flutter, LLVM, vcpkg).
+#   ./Setup-DVForge-Fedora.sh --appimage       # Create Python venv and install packaging dependencies.
+#   ./Setup-DVForge-Fedora.sh --toolbox        # Force running inside a Fedora 41 Toolbox container.
+#   ./Setup-DVForge-Fedora.sh --no-toolbox     # Force running natively on the host system.
+#   ./Setup-DVForge-Fedora.sh --skip-toolchains# Skip toolchain bootstrap.
 
 set -e
 
 # --- default configuration ---
 INSTALL_APPIMAGE_DEPS=false
 INSTALL_TOOLCHAINS=true
+
+# Auto-detect if host Fedora version requires Toolbox (Fedora 43+ introduces GCC 16 issues)
+AUTO_USE_TOOLBOX=false
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    if [ "$ID" = "fedora" ] && [ "${VERSION_ID:-0}" -ge 43 ]; then
+        AUTO_USE_TOOLBOX=true
+    fi
+fi
+
+FORCE_TOOLBOX="" # "true" or "false"
 
 # --- argument parsing ---
 show_help() {
@@ -27,11 +36,13 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   --appimage          Create Python venv and install packaging dependencies (appimage-builder).
+  --toolbox           Force execution inside a Fedora 41 Toolbox container.
+  --no-toolbox        Force running natively on the host system (skip toolbox).
   --skip-toolchains   Skip toolchain bootstrap (Rust, Java, Android SDK/NDK, Flutter, LLVM, vcpkg).
   -h, --help          Show this help message.
 
-Default behavior (no flags):
-  Installs system DNF dependencies and bootstraps toolchains, but skips the Python venv/pip steps.
+Default behavior:
+  Auto-detects Fedora version. Fedora 43+ defaults to using a Toolbox container to fix GCC 16 issues.
 EOF
     exit 0
 }
@@ -40,6 +51,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --appimage)
             INSTALL_APPIMAGE_DEPS=true
+            shift
+            ;;
+        --toolbox)
+            FORCE_TOOLBOX="true"
+            shift
+            ;;
+        --no-toolbox)
+            FORCE_TOOLBOX="false"
             shift
             ;;
         --skip-toolchains)
@@ -56,6 +75,39 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Determine final toolbox decision
+USE_TOOLBOX="$AUTO_USE_TOOLBOX"
+if [ "$FORCE_TOOLBOX" = "true" ]; then
+    USE_TOOLBOX=true
+elif [ "$FORCE_TOOLBOX" = "false" ]; then
+    USE_TOOLBOX=false
+fi
+
+# --- Toolbox Isolation Check ---
+if [ "$USE_TOOLBOX" = "true" ] && [ ! -f /run/.containerenv ] && [ ! -f /.dockerenv ]; then
+    TOOLBOX_NAME="dvforge-f41"
+    
+    echo "=== Fedora version 43+ detected (or forced toolbox) ==="
+    echo "Managing Toolbox container: ${TOOLBOX_NAME} (Fedora 41)..."
+
+    if ! command -v toolbox >/dev/null 2>&1; then
+        echo "Installing 'toolbox' on host Fedora..."
+        sudo dnf install -y toolbox
+    fi
+
+    if ! toolbox list | grep -q "${TOOLBOX_NAME}"; then
+        echo "Creating Fedora 41 toolbox container..."
+        toolbox create --release f41 -y --container "${TOOLBOX_NAME}"
+    fi
+
+    echo "Entering Fedora 41 Toolbox to run setup and build..."
+    exec toolbox run --container "${TOOLBOX_NAME}" bash "$0" "$@"
+fi
+
+# ====================================================================
+# EXECUTION ENVIRONMENT (Host or Toolbox Container)
+# ====================================================================
 
 # --- helpers ---
 log()  { echo -e "\n=== $1 ==="; }
@@ -80,6 +132,7 @@ ok "Packages updated"
 log "Installing build dependencies"
 DEPS=(
     gcc gcc-c++ make git python3 python3-pip python3-devel curl wget unzip zip tar
+    perl perl-FindBin perl-IPC-Cmd glycin-loaders
     pkgconf-pkg-config openssl-devel sqlite-devel clang-devel llvm-devel
     cmake ninja-build file
     rpm-build ImageMagick bsdtar
@@ -96,6 +149,8 @@ DEPS=(
     libffi-devel potrace
     fuse-libs
 )
+
+sudo mkdir -p /usr/include/glycin-2
 
 # Optional 32-bit ncurses compat library
 for ncurses_pkg in ncurses-compat-libs.i686 ncurses-libs.i686; do
@@ -120,19 +175,6 @@ else
 fi
 
 # Fedora TLS CA certificate compatibility
-#
-# Older Flutter/Dart tooling may look for the CA bundle at the traditional
-# OpenSSL path:
-#
-#   /etc/pki/tls/certs/ca-bundle.crt
-#
-# Fedora's current extracted CA bundle is located at:
-#
-#   /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
-#
-# Provide the expected path without replacing Fedora's managed CA bundle.
-# This is idempotent and only creates/fixes the symlink when necessary.
-
 log "Checking TLS CA certificate compatibility"
 
 CA_SOURCE="/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
@@ -144,23 +186,17 @@ else
     CA_NEEDS_FIX=false
 
     if [ ! -e "${CA_LINK}" ] && [ ! -L "${CA_LINK}" ]; then
-        # Expected CA bundle path does not exist.
         CA_NEEDS_FIX=true
     elif [ ! -L "${CA_LINK}" ]; then
-        # A real file exists at the expected path. Do not replace it.
         warn "${CA_LINK} exists but is not a symlink; leaving it unchanged"
     elif [ "$(readlink -f "${CA_LINK}")" != "${CA_SOURCE}" ]; then
-        # A symlink exists, but it points somewhere other than Fedora's
-        # current CA bundle.
         CA_NEEDS_FIX=true
     fi
 
     if [ "${CA_NEEDS_FIX}" = true ]; then
         log "Creating Fedora CA bundle compatibility symlink"
-
         sudo mkdir -p "$(dirname "${CA_LINK}")"
         sudo ln -sfn "${CA_SOURCE}" "${CA_LINK}"
-
         ok "TLS CA bundle compatibility link created"
     else
         ok "TLS CA bundle compatibility link already configured"
@@ -178,7 +214,6 @@ VENV_DIR="${PROJECT_DIR}/.venv"
 if [ "$INSTALL_APPIMAGE_DEPS" = true ]; then
     log "Setting up Python virtual environment & AppImage dependencies (--appimage enabled)"
 
-    # appimage-builder internally invokes dpkg/apt when packaging Debian binaries
     EXTRA_PKG=()
     for p in dpkg apt gnupg2; do
         if ! rpm -q "$p" >/dev/null 2>&1; then
@@ -201,7 +236,6 @@ if [ "$INSTALL_APPIMAGE_DEPS" = true ]; then
     "${VENV_DIR}/bin/pip" install "setuptools_scm<10"
     "${VENV_DIR}/bin/pip" install "git+https://github.com/rustdesk-org/appimage-builder.git"
 
-    # Create a compatibility shim if apt-key is not on $PATH
     if ! command -v apt-key >/dev/null 2>&1; then
         log "'apt-key' not found on \$PATH. Creating compatibility shim at /usr/local/bin/apt-key..."
 
@@ -233,7 +267,6 @@ EOF
         log "'apt-key' already exists at $(command -v apt-key)."
     fi
 
-    # Prevent committing .venv if repo lacks .gitignore
     if [ -d "${PROJECT_DIR}/.git" ]; then
         EXCLUDE_FILE="${PROJECT_DIR}/.git/info/exclude"
         if ! grep -qs "^.venv/" "${EXCLUDE_FILE}" 2>/dev/null; then
@@ -249,14 +282,12 @@ fi
 if [ "$INSTALL_TOOLCHAINS" = true ]; then
     log "Bootstrapping toolchains"
 
-    # Determine python executable to run toolchains.py
     if [ "$INSTALL_APPIMAGE_DEPS" = true ] && [ -x "${VENV_DIR}/bin/python3" ]; then
         PY_EXEC="${VENV_DIR}/bin/python3"
     else
         PY_EXEC="python3"
     fi
 
-    # Locate toolchains.py relative to script location
     TOOLCHAINS_PY=""
     for cand in "${PROJECT_DIR}/toolchains.py" "${PROJECT_DIR}/builder/toolchains.py"; do
         if [ -f "$cand" ]; then
@@ -265,7 +296,6 @@ if [ "$INSTALL_TOOLCHAINS" = true ]; then
         fi
     done
 
-    # Ensure cargo and rust binaries are visible to Python and any subprocesses it spawns
     export PATH="${HOME}/.cargo/bin:${PATH}"
 
     if [ -n "${TOOLCHAINS_PY}" ]; then
@@ -277,7 +307,6 @@ if [ "$INSTALL_TOOLCHAINS" = true ]; then
         warn "Could not locate toolchains.py; skipping automated SDK downloads."
     fi
 
-    # Fallback / Verification for sccache
     if ! command -v sccache >/dev/null 2>&1 && [ ! -f "${HOME}/.cargo/bin/sccache" ]; then
         log "Installing sccache 0.11.0 directly via cargo..."
         cargo install sccache --version 0.11.0 --locked
@@ -286,7 +315,6 @@ if [ "$INSTALL_TOOLCHAINS" = true ]; then
         ok "sccache is present"
     fi
 
-    # Rust Toolchain Configuration
     if have rustup || [ -x "${HOME}/.cargo/bin/rustup" ]; then
         rustup toolchain install 1.75 --profile minimal || true
         rustup default 1.75 || true
@@ -294,7 +322,6 @@ if [ "$INSTALL_TOOLCHAINS" = true ]; then
         ok "Rust 1.75 toolchain and rustfmt configured"
     fi
 
-    # Fix Android NDK execute permissions
     NDK_DIR="${PROJECT_DIR}/.toolchains/android_ndk"
     if [ -d "${NDK_DIR}" ]; then
         log "Fixing Android NDK binary permissions..."
@@ -315,10 +342,27 @@ fi
 
 log ""
 log "Setup complete!"
-if [ "$INSTALL_APPIMAGE_DEPS" = true ]; then
-    log "To run the application with your venv:"
-    log "  source .venv/bin/activate && ./run.sh"
+
+TOOLBOX_NAME="dvforge-f41"
+
+if [ "$USE_TOOLBOX" = "true" ]; then
+    log "Environment running inside Fedora Toolbox container (${TOOLBOX_NAME})."
+    log "To enter your development container manually later:"
+    log "  toolbox enter ${TOOLBOX_NAME}"
+    log ""
+    if [ "$INSTALL_APPIMAGE_DEPS" = true ]; then
+        log "To run the application inside the toolbox:"
+        log "  toolbox enter ${TOOLBOX_NAME} bash -c 'cd $(pwd) && source .venv/bin/activate && ./run.sh'"
+    else
+        log "To run the application inside the toolbox:"
+        log "  toolbox enter ${TOOLBOX_NAME} bash -c 'cd $(pwd) && ./run.sh'"
+    fi
 else
-    log "To run the application:"
-    log "  ./run.sh"
+    if [ "$INSTALL_APPIMAGE_DEPS" = true ]; then
+        log "To run the application with your venv:"
+        log "  source .venv/bin/activate && ./run.sh"
+    else
+        log "To run the application:"
+        log "  ./run.sh"
+    fi
 fi
