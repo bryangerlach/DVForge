@@ -364,6 +364,17 @@ def publish(job, result, d):
         json.dump(status, f, indent=2)
         f.write("\n")
     upload_ok = True
+    if upload_ok:
+        job_version = job.get("version") or "1.4.9"
+        clean_version = job_version.lstrip("v")
+        app_root = os.path.dirname(HERE)
+        output_dir = os.path.join(app_root, "workspace", "output", clean_version)
+        if os.path.isdir(output_dir):
+            try:
+                shutil.rmtree(output_dir, ignore_errors=True)
+                log("cleaned up local build output directory: %s" % output_dir)
+            except OSError as e:
+                log("failed to clean up output directory %s: %s" % (output_dir, e))
     if QUEUE_BASE:
         for path in copied:
             name = os.path.basename(path)
