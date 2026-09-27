@@ -186,7 +186,7 @@ TARGETS = [
      "note": "Portable, distro-independent."},
     {"id": "linux-aarch64-deb", "platform": "linux", "arch": "aarch64",
      "label": "Linux arm64 — .deb", "ext": "deb", "host_os": ["Linux"],
-     "note": "arm64 build. Native on an arm64 Linux host; needs flutter-elinux."},
+     "note": "arm64 build. Native on an arm64 Linux host; dispatched to a farm worker on x86_64."},
 
     # ---- Android (NDK) -> Linux or macOS ----
     # Windows is still blocked: MSYS2 Perl breaks openssl-sys. macOS uses the
@@ -245,6 +245,7 @@ def build_matrix(host=None, prereqs=None):
         row["buildable"] = buildable
         row["missing_tools"] = []
         row["blocked_reason"] = ""
+        row["farm_dispatch"] = False
 
         if not buildable:
             hosts = " or ".join(t["host_os"])
@@ -253,12 +254,13 @@ def build_matrix(host=None, prereqs=None):
             rows.append(row)
             continue
 
-        # arm64 desktop cross note: buildable but slower / needs elinux unless host is arm64
-        if t["arch"] == "aarch64" and t["platform"] == "linux" and host_arch != "aarch64":
-            row["blocked_reason"] = "Cross-compiles from x86_64 via flutter-elinux (slower)."
+        # arm64 desktop Linux is farm-dispatched from x86_64 hosts; the local
+        # orchestrator does not need the Linux toolchain for that target.
+        farm_dispatch = (t["id"] == "linux-aarch64-deb" and
+                         host_os_name == "Linux" and host_arch != "aarch64")
 
         # toolchain readiness
-        needed = required_tools(t, host_os_name)
+        needed = [] if farm_dispatch else required_tools(t, host_os_name)
         missing = []
         if prereqs:
             for tool in needed:
@@ -267,7 +269,10 @@ def build_matrix(host=None, prereqs=None):
                     missing.append(tool)
         row["missing_tools"] = missing
         row["required_tools"] = needed
+        row["farm_dispatch"] = farm_dispatch
         row["ready"] = buildable and not missing
+        if farm_dispatch:
+            row["note"] = (row.get("note", "") + " Queued for an arm64 Linux farm worker.").strip()
         if missing and not row["blocked_reason"]:
             row["blocked_reason"] = "Missing: " + ", ".join(missing)
         rows.append(row)

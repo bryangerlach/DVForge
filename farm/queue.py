@@ -46,7 +46,7 @@ INBOX = os.path.join(FARM, "inbox")
 OUTBOX = os.path.join(FARM, "outbox")
 FAILED = os.path.join(FARM, "failed")
 RUNNING = os.path.join(FARM, "running")
-SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+SAFE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 
 # Same prefixes as worker.py — HTTP workers claim through /claim instead of NFS.
 CLAIM = {
@@ -56,6 +56,7 @@ CLAIM = {
 }
 OS_LABEL = {"Darwin": "macos", "Windows": "windows", "Linux": "linux"}
 ONLINE_SEC = 300
+STALE_RUNNING_SEC = 15 * 60
 # Ban after this many attempts with zero successes, or this many fails in a row.
 BAN_AFTER_FAIL_ONLY = 2
 BAN_AFTER_STREAK = 5
@@ -80,14 +81,38 @@ def _prefixes(os_name, android_on_mac=False):
     return tuple(p)
 
 
-def _can_claim(job, os_name, android_on_mac=False):
+def _norm_arch(arch):
+    a = (arch or "").lower().replace("amd64", "x86_64")
+    return "aarch64" if a == "arm64" else a
+
+
+def _target_arch_ok(target, host_arch):
+    arch = _norm_arch(host_arch)
+    if target.startswith("linux-aarch64"):
+        return arch == "aarch64"
+    if target.startswith("linux-x86_64"):
+        return arch == "x86_64"
+    if target.startswith("linux-armv7"):
+        return arch.startswith("armv7")
+    if target.startswith("macos-"):
+        return True
+    if target.startswith("windows-"):
+        return True
+    return True
+
+
+def _can_claim(job, os_name, android_on_mac=False, host_arch=""):
     targets = job.get("targets") or []
     if not targets:
         return False
     pref = _prefixes(os_name, android_on_mac)
     if not pref:
         return False
-    return all(any(str(t).startswith(x) for x in pref) for t in targets)
+    return all(
+        any(str(t).startswith(x) for x in pref) and
+        _target_arch_ok(str(t), host_arch)
+        for t in targets
+    )
 
 
 def _job_assign(job):
@@ -181,8 +206,8 @@ def reset_rating(worker_name):
     return rating_public(name)
 
 
-def _better_idle_online(os_name, worker_name):
-    """Name of a higher-rated idle worker of the same OS, else None."""
+def _better_idle_online(job, os_name, worker_name):
+    """Higher-rated idle worker eligible for this job, else None."""
     mine = rating_public(worker_name)["score"]
     now = time.time()
     with _LOCK:
@@ -191,7 +216,11 @@ def _better_idle_online(os_name, worker_name):
         name = (rec.get("name") or "").strip()
         if not name or name == worker_name:
             continue
-        if (rec.get("os") or "") != os_name:
+        rec_os = rec.get("os") or ""
+        if rec_os != os_name:
+            continue
+        if not _can_claim(job, rec_os, bool(rec.get("android")),
+                          rec.get("arch") or ""):
             continue
         last = float(rec.get("last_seen") or 0)
         if last <= 0 or (now - last) > ONLINE_SEC:
@@ -206,7 +235,83 @@ def _better_idle_online(os_name, worker_name):
     return None
 
 
-def claim_job(os_name, worker_name, android_on_mac=False):
+def _write_json(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _recover_stale_running(now=None):
+    """Requeue claims whose worker died before it could report progress."""
+    now = time.time() if now is None else now
+    try:
+        names = sorted(os.listdir(RUNNING))
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(".json") or name.endswith(".progress.json"):
+            continue
+        src = os.path.join(RUNNING, name)
+        jid = name[:-5]
+        if (os.path.isfile(os.path.join(OUTBOX, jid, "status.json")) or
+                os.path.isfile(os.path.join(FAILED, name))):
+            continue
+        progress = src[:-5] + ".progress.json"
+        try:
+            newest = os.path.getmtime(src)
+            if os.path.isfile(progress):
+                newest = max(newest, os.path.getmtime(progress))
+        except OSError:
+            continue
+        if now - newest < STALE_RUNNING_SEC:
+            continue
+        try:
+            with open(src, encoding="utf-8") as f:
+                job = json.load(f)
+        except Exception:
+            job = {}
+        for key in ("_file", "_claimed_by", "_claimed_at", "_claim_token"):
+            job.pop(key, None)
+        dest = os.path.join(INBOX, name)
+        try:
+            os.makedirs(INBOX, exist_ok=True)
+            _write_json(dest, job)
+            os.remove(src)
+            try:
+                os.remove(progress)
+            except OSError:
+                pass
+        except OSError:
+            continue
+
+
+def _running_claim(jid):
+    path = os.path.join(RUNNING, jid + ".json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _claim_matches(jid, worker="", token=""):
+    """True when this progress/result belongs to the current claim."""
+    job = _running_claim(jid)
+    if not isinstance(job, dict):
+        return False
+    expected_worker = job.get("_claimed_by") or ""
+    expected_token = job.get("_claim_token") or ""
+    if expected_token:
+        return token == expected_token and (
+            not expected_worker or worker == expected_worker)
+    # Legacy claims have no token; accept them only when the worker matches.
+    return not expected_worker or worker == expected_worker
+
+
+def claim_job(os_name, worker_name, android_on_mac=False, host_arch=""):
     """Rename inbox → running for the best job this worker may take.
 
     Unassigned jobs: blocked workers are skipped; if a higher-rated idle
@@ -218,12 +323,12 @@ def claim_job(os_name, worker_name, android_on_mac=False):
     outdated workers from claiming jobs that need a newer vcpkg commit.
     Workers that didn't report `versions` are treated as compatible with all.
     """
+    _recover_stale_running()
     try:
         names = sorted(os.listdir(INBOX))
     except OSError:
         return None
     me_ok = rating_public(worker_name)["eligible"]
-    better = _better_idle_online(os_name, worker_name) if me_ok else None
     with _LOCK:
         my_versions = list(WORKERS.get(worker_name, {}).get("versions") or [])
     for name in names:
@@ -235,7 +340,7 @@ def claim_job(os_name, worker_name, android_on_mac=False):
                 job = json.load(f)
         except Exception:
             continue
-        if not _can_claim(job, os_name, android_on_mac):
+        if not _can_claim(job, os_name, android_on_mac, host_arch):
             continue
         # Version gate: skip jobs whose RustDesk version this worker can't build.
         job_ver = (job.get("version") or "1.4.9").lstrip("v")
@@ -248,7 +353,7 @@ def claim_job(os_name, worker_name, android_on_mac=False):
         else:
             if not me_ok:
                 continue
-            if better:
+            if _better_idle_online(job, os_name, worker_name):
                 continue
         os.makedirs(RUNNING, exist_ok=True)
         dest = os.path.join(RUNNING, name)
@@ -258,6 +363,9 @@ def claim_job(os_name, worker_name, android_on_mac=False):
             continue
         job["_file"] = name
         job["_claimed_by"] = worker_name
+        job["_claimed_at"] = time.time()
+        job["_claim_token"] = uuid.uuid4().hex
+        _write_json(dest, job)
         return job
     return None
 
@@ -272,7 +380,11 @@ def _pack_job_config(job):
         if root not in sys.path:
             sys.path.insert(0, root)
         from builder import config_gen
-        packed = config_gen.pack_portable(cfg, root)
+        allowed = (
+            os.path.join(root, "workspace", "branding"),
+            os.path.join(root, "workspace", "signing"),
+        )
+        packed = config_gen.pack_portable(cfg, root, allowed_roots=allowed)
         job["config"] = cfg
         if packed:
             job["portable"] = packed
@@ -283,6 +395,8 @@ def _pack_job_config(job):
 def write_job(job):
     os.makedirs(INBOX, exist_ok=True)
     jid = (job.get("id") or "").strip() or _jid()
+    if not SAFE_ID.match(jid):
+        raise ValueError("invalid job id")
     job["id"] = jid
     job.setdefault("submitted", time.strftime("%Y-%m-%dT%H:%M:%S"))
     _pack_job_config(job)
@@ -381,6 +495,7 @@ HINTS = {
     "android-arm64": "Usually 15–30 min on Mac/Linux with NDK already installed.",
     "android-universal": "Usually 40–70 min — every ABI.",
     "linux-x86_64-deb": "Usually 10–25 min on a warmed Linux box.",
+    "linux-aarch64-deb": "Usually 15–45 min; QEMU emulation can take much longer.",
     "linux-x86_64-rpm": "Usually 10–25 min (needs rpmbuild).",
     "linux-x86_64-appimage": "Usually 12–30 min.",
 }
@@ -395,6 +510,7 @@ TYPICAL_SEC = {
     "android-arm64": 20 * 60,
     "android-universal": 50 * 60,
     "linux-x86_64-deb": 15 * 60,
+    "linux-aarch64-deb": 30 * 60,
     "linux-x86_64-rpm": 15 * 60,
     "linux-x86_64-appimage": 18 * 60,
 }
@@ -431,6 +547,7 @@ def _peek_job(path):
         "typical_sec": TYPICAL_SEC.get(t0, 20 * 60),
         "waiting_for": who,
         "assign": assign,
+        "claimed_by": job.get("_claimed_by") or "",
         "submitted": job.get("submitted") or "",
     }
 
@@ -511,7 +628,7 @@ def one_job(jid):
 
 
 def note_worker(os_name, worker_name, android=False, busy=None,
-                webhook=None, current_job=None, versions=None):
+                webhook=None, current_job=None, versions=None, arch=None):
     """Remember a /claim or /progress ping. In-memory; resets if queue.py restarts."""
     name = (worker_name or "").strip()
     if not name:
@@ -522,6 +639,8 @@ def note_worker(os_name, worker_name, android=False, busy=None,
         if os_name:
             rec["os"] = os_name
         rec["android"] = bool(android) or bool(rec.get("android"))
+        if arch is not None:
+            rec["arch"] = _norm_arch(arch)
         rec["last_seen"] = time.time()
         if busy is not None:
             rec["busy"] = bool(busy)
@@ -769,6 +888,7 @@ def farm_stats():
             "name": rec.get("name") or "",
             "os": rec.get("os") or "",
             "platform": plat,
+            "arch": _norm_arch(rec.get("arch") or ""),
             "claiming": rec.get("claiming") or list(CLAIM.get(rec.get("os") or "", ()) or ()),
             "android": bool(rec.get("android")),
             "last_seen_sec": age,
@@ -968,11 +1088,12 @@ class Handler(BaseHTTPRequestHandler):
             android = bool(data.get("android"))
             webhook = data.get("webhook") or ""
             versions = data.get("versions") or []
-            job = claim_job(os_name, worker, android)
+            host_arch = data.get("arch") or ""
+            job = claim_job(os_name, worker, android, host_arch)
             note_worker(os_name, worker, android, busy=bool(job),
                         webhook=webhook,
                         current_job=(job.get("id") if job else None),
-                        versions=versions)
+                        versions=versions, arch=host_arch)
             if not job:
                 return self._send(200, {"ok": True, "job": None})
             return self._send(200, {"ok": True, "job": job})
@@ -985,6 +1106,9 @@ class Handler(BaseHTTPRequestHandler):
                 prog = json.loads(self._body().decode("utf-8") or "{}")
             except Exception as e:
                 return self._send(400, {"error": str(e)})
+            if not _claim_matches(jid, prog.get("worker") or "",
+                                  prog.get("claim") or ""):
+                return self._send(409, {"error": "stale or unknown claim"})
             os.makedirs(RUNNING, exist_ok=True)
             dest = os.path.join(RUNNING, jid + ".progress.json")
             tmp = dest + ".tmp"
@@ -1005,6 +1129,9 @@ class Handler(BaseHTTPRequestHandler):
                 status = json.loads(self._body().decode("utf-8") or "{}")
             except Exception as e:
                 return self._send(400, {"error": str(e)})
+            if not _claim_matches(jid, status.get("worker") or "",
+                                  status.get("claim") or ""):
+                return self._send(409, {"error": "stale or unknown claim"})
             out = os.path.join(OUTBOX, jid)
             os.makedirs(out, exist_ok=True)
             with open(os.path.join(out, "status.json"), "w", encoding="utf-8") as f:
@@ -1038,6 +1165,9 @@ class Handler(BaseHTTPRequestHandler):
             name = os.path.basename((qs.get("name") or [""])[0])
             if not SAFE_ID.match(jid or "") or not name or name in (".", "..", "status.json"):
                 return self._send(400, {"error": "bad artifact path"})
+            if not _claim_matches(jid, (qs.get("worker") or [""])[0],
+                                  (qs.get("claim") or [""])[0]):
+                return self._send(409, {"error": "stale or unknown claim"})
             out = os.path.join(OUTBOX, jid)
             os.makedirs(out, exist_ok=True)
             dest = os.path.join(out, name)
@@ -1063,6 +1193,16 @@ class Handler(BaseHTTPRequestHandler):
         raw = self._body()
         try:
             job = parse_body(raw, qs)
+            assign = _job_assign(job)
+            if assign:
+                with _LOCK:
+                    rec = dict(WORKERS.get(assign) or {})
+                if (rec.get("os") and
+                        not _can_claim(job, rec.get("os"), bool(rec.get("android")),
+                                       rec.get("arch") or "")):
+                    raise ValueError(
+                        "assigned worker %s cannot build targets %s"
+                        % (assign, ", ".join(str(t) for t in job.get("targets") or [])))
             jid, dest = write_job(job)
         except ValueError as e:
             return self._send(400, {"error": str(e)})

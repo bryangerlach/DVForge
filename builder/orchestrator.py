@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import zipfile
 import platform as _platform
 import urllib.error
@@ -280,14 +281,35 @@ class Build:
         except FileNotFoundError:
             exe = cmd if isinstance(cmd, str) else cmd[0]
             raise RuntimeError(f"could not launch '{exe}' — is it installed and on PATH?")
+        output = []
+
+        def _pump_output():
+            try:
+                for line in proc.stdout:
+                    output.append(line)
+            finally:
+                proc.stdout.close()
+
+        reader = threading.Thread(target=_pump_output, daemon=True)
+        reader.start()
         try:
-            for line in proc.stdout:
-                self.log(line.rstrip("\n"))
+            while proc.poll() is None:
+                while output:
+                    self.log(output.pop(0).rstrip("\n"))
                 if self.cancel_event.is_set():
                     proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
                     raise BuildCancelled()
+                time.sleep(0.05)
+            reader.join(timeout=1)
+            while output:
+                self.log(output.pop(0).rstrip("\n"))
         finally:
-            proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
         rc = proc.wait()
         if check and rc != 0:
             raise RuntimeError(f"command failed (exit {rc}): {pretty}")
@@ -765,6 +787,10 @@ class Build:
         # where rustup default failed for a bad triple and we stayed on another
         # toolchain).
         self.run(["rustup", "component", "add", "rustfmt"], check=False)
+        if not self.dry_run and not shutil.which("rustfmt", path=self._effective_path()):
+            raise RuntimeError(
+                "rustfmt is required by flutter_rust_bridge_codegen but is not "
+                f"installed for Rust {toolchain}. Run: rustup component add rustfmt")
 
     def _ensure_macos_sdk(self):
         """Point bindgen/libclang at the Apple SDK so system headers resolve.
@@ -1256,6 +1282,10 @@ class Build:
         if not codegen and not self.dry_run:
             raise RuntimeError(
                 "flutter_rust_bridge_codegen not found after cargo install")
+        if not self.dry_run and not shutil.which("dart", path=self._effective_path()):
+            raise RuntimeError(
+                "dart not found on PATH; flutter_rust_bridge_codegen needs it "
+                "to run build_runner and format generated Dart code")
         cmd = [codegen or "flutter_rust_bridge_codegen",
                "--rust-input", "./src/flutter_ffi.rs",
                "--dart-output", "./flutter/lib/generated_bridge.dart",
@@ -2360,13 +2390,16 @@ class Build:
             os.environ["CXXFLAGS"] = (
                 (existing + " ") if existing else "") + "-include cstdint"
         self.log(f"  · CXXFLAGS={os.environ['CXXFLAGS']!r} (GCC 15+ compat)")
-        self.setup_vcpkg("x64-linux")
+        triplet = ("arm64-linux" if any(t.startswith("linux-aarch64")
+                                        for t in self.target_ids)
+                   else "x64-linux")
+        self.setup_vcpkg(triplet)
         self.customize_for("linux")
         # BINARY_NAME change poisons CMakeCache the same way Windows does.
         self._invalidate_stale_flutter_linux()
         # base64 custom_.txt staged for build.py + bundle (SKILL.md §4.4)
-        if not self.dry_run:
-            env = self._env()
+        env = self._env() if not self.dry_run else None
+        if env is not None:
             customize.write_custom_txt(self.src_dir, env, log=self.log)
         # build.py auto-detects distro and calls build_flutter_deb on
         # Debian/Ubuntu. That's fine for .deb targets, but for .rpm and
@@ -2376,29 +2409,21 @@ class Build:
                         for t in linux_targets)
         wants_rpm = "linux-x86_64-rpm" in linux_targets
         wants_appimage = "linux-x86_64-appimage" in linux_targets
-        # If only .deb is requested, let build.py do its default thing.
-        # Otherwise, skip build.py's packaging and do it ourselves.
-        if wants_deb and not wants_rpm and not wants_appimage:
-            self.run([self._py(), "build.py", "--flutter"],
-                     cwd=self.src_dir, check=False)
-        else:
-            # Run cargo + flutter build without packaging, then package ourselves.
-            self._build_linux_core()
-            # Write custom_.txt into the flutter bundle BEFORE packaging,
-            # since rpm/Arch specs copy from the bundle directory.
-            for arch in ("x64", "arm64"):
-                bundle = os.path.join(self.src_dir, "flutter", "build", "linux",
-                                      arch, "release", "bundle")
-                if os.path.isdir(bundle):
-                    customize.write_custom_txt(bundle, env, log=self.log)
-            # appimage-builder extracts from the .deb, so always build it
-            # first when AppImage is requested.
-            if wants_deb or wants_appimage:
-                self._package_linux_deb()
-            if wants_rpm:
-                self._package_linux_rpm()
-            if wants_appimage:
-                self._package_linux_appimage()
+        self._build_linux_core()
+        # Write custom_.txt into the flutter bundle BEFORE packaging. The .deb
+        # copies this bundle, and appimage-builder subsequently extracts the .deb.
+        bundle = self._linux_bundle_dir()
+        if env is not None and bundle:
+            customize.write_custom_txt(bundle, env, log=self.log)
+        elif env is not None and not self.dry_run:
+            self.log("  ! flutter linux bundle not found — custom_.txt not staged")
+        # appimage-builder extracts from the .deb, so always build it first.
+        if wants_deb or wants_appimage:
+            self._package_linux_deb()
+        if wants_rpm:
+            self._package_linux_rpm()
+        if wants_appimage:
+            self._package_linux_appimage()
         self._collect(self.src_dir, (".deb", ".rpm", ".AppImage", ".flatpak",
                                      ".pkg.tar.zst"), "linux")
 
@@ -2415,21 +2440,65 @@ class Build:
                  cwd=flutter_dir, check=False)
 
     def _linux_bundle_dir(self):
-        """Find the flutter linux bundle directory."""
-        for arch in ("x64", "arm64"):
-            b = os.path.join(self.src_dir, "flutter", "build", "linux",
-                             arch, "release", "bundle")
-            if os.path.isdir(b):
-                return b
-        return None
+        """Return the Flutter bundle for the requested Linux architecture."""
+        arch = ("arm64" if any(t.startswith("linux-aarch64")
+                              for t in self.target_ids) else "x64")
+        bundle = os.path.join(self.src_dir, "flutter", "build", "linux",
+                              arch, "release", "bundle")
+        return bundle if os.path.isdir(bundle) else None
 
     def _package_linux_deb(self):
         """Package the flutter bundle into a .deb using build.py's logic."""
         self.log("  · packaging .deb")
-        # Delegate to build.py's build_flutter_deb by running build.py
-        # with --skip-cargo (we already built the lib in _build_linux_core).
+        build_py = os.path.join(self.src_dir, "build.py")
+        if any(t.startswith("linux-aarch64") for t in self.target_ids):
+            with open(build_py, "r", encoding="utf-8", errors="surrogateescape") as f:
+                text = f.read()
+            old = "build/linux/x64/release/bundle/"
+            new = "build/linux/arm64/release/bundle/"
+            if old in text:
+                text = text.replace(old, new, 1)
+                self.log("  · patched build.py Linux bundle path: x64 -> arm64")
+            with open(build_py, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(text)
+        with open(build_py, "r", encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read()
+        copy_bundle = ("    system2(\n"
+                       "        f'cp -r {flutter_build_dir}/* "
+                       "tmpdeb/usr/share/rustdesk/')")
+        copy_custom = ("    system2('cp ../custom_.txt "
+                       "tmpdeb/usr/share/rustdesk/custom_.txt')")
+        if copy_custom not in text:
+            if copy_bundle not in text:
+                raise RuntimeError("could not patch build.py to package custom_.txt")
+            text = text.replace(copy_bundle, copy_bundle + "\n" + copy_custom, 1)
+            with open(build_py, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(text)
+            self.log("  · patched build.py to package custom_.txt")
+        # Delegate to build.py with --skip-cargo; the native library and Flutter
+        # bundle are already built and custom_.txt is staged in that bundle.
+        deb_arch = ("arm64" if any(t.startswith("linux-aarch64")
+                                  for t in self.target_ids) else "amd64")
         self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
-                 cwd=self.src_dir, check=False)
+                 cwd=self.src_dir, env={"DEB_ARCH": deb_arch})
+        if self.dry_run:
+            return
+        deb_path = os.path.join(self.src_dir, f"rustdesk-{self.version}.deb")
+        if not os.path.isfile(deb_path):
+            raise RuntimeError("Linux .deb packaging did not produce an artifact")
+        bundle = self._linux_bundle_dir()
+        if bundle and os.path.isfile(os.path.join(bundle, "custom_.txt")):
+            listing = subprocess.check_output(
+                ["dpkg-deb", "--contents", deb_path],
+                encoding="utf-8", errors="replace")
+            if "custom_.txt" not in listing:
+                raise RuntimeError("Linux .deb is missing custom_.txt")
+        actual_arch = subprocess.check_output(
+            ["dpkg-deb", "--field", deb_path, "Architecture"],
+            encoding="utf-8", errors="replace").strip()
+        if actual_arch != deb_arch:
+            raise RuntimeError(
+                f"Linux .deb architecture is {actual_arch}, expected {deb_arch}")
 
     def _output_basename(self):
         """The custom file name for output artifacts (e.g. 'myapp-1.4.9').
@@ -4411,6 +4480,123 @@ class Build:
         self.artifacts.append(dest)
         self.log(f"  ✓ artifact: {dest}")
 
+    # -- farm dispatch ------------------------------------------------------
+    def _farm_only_targets(self):
+        """Return targets the local host cannot build and must hand to a farm worker."""
+        farm_targets = []
+        host_os = self.host.get("os")
+        host_arch = self.host.get("arch", "")
+        for tid in self.target_ids:
+            # Flutter desktop Linux arm64 cannot be cross-compiled locally.
+            if tid == "linux-aarch64-deb" and host_os == "Linux" and host_arch not in ("aarch64", "arm64"):
+                farm_targets.append(tid)
+        return farm_targets
+
+    def _farm_dir(self):
+        """Root of the farm shared folder."""
+        default = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "farm")
+        return os.environ.get("DVFORGE_FARM", default)
+
+    def _queue_farm_job(self, target_ids):
+        """Submit target(s) to the farm queue and return (job id, farm dir)."""
+        if not target_ids:
+            return None
+        if self.dry_run:
+            self.log(f"  (would dispatch {', '.join(target_ids)} to farm worker)")
+            return None
+
+        farm = self._farm_dir()
+        inbox = os.path.join(farm, "inbox")
+        if not os.path.isdir(inbox):
+            raise RuntimeError(
+                f"farm inbox not found: {inbox}\n"
+                "Set DVFORGE_FARM to the shared farm directory, or run a farm worker "
+                "that can build these targets.")
+
+        cfg = dict(self.config or {})
+        try:
+            from . import config_gen
+            packed = config_gen.pack_portable(
+                cfg, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        except Exception:
+            packed = []
+
+        jid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        job = {
+            "id": jid,
+            "version": self.version,
+            "targets": list(target_ids),
+            "dry_run": bool(self.dry_run),
+            "config": cfg,
+            "submitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        if packed:
+            job["portable"] = packed
+        os.makedirs(inbox, exist_ok=True)
+        dest = os.path.join(inbox, jid + ".json")
+        tmp = dest + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(job, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, dest)
+
+        self.log(f"\n=== Farm dispatch ===")
+        self.log(f"  queued job {jid} for {', '.join(target_ids)}")
+        self.log(f"  waiting for worker in {os.path.join(farm, 'outbox')}/{jid}/ …")
+        return jid, farm
+
+    def _wait_for_farm_job(self, jid, farm):
+        """Wait for a queued farm job and copy its artifacts into out_dir."""
+        outbox = os.path.join(farm, "outbox")
+        status_path = os.path.join(outbox, jid, "status.json")
+        failed_path = os.path.join(farm, "failed", jid + ".json")
+        deadline = time.time() + 4 * 3600  # 4 hours
+        poll_interval = 5
+        while time.time() < deadline:
+            self._check_cancel()
+            if os.path.isfile(status_path):
+                try:
+                    with open(status_path, encoding="utf-8") as f:
+                        status = json.load(f)
+                except Exception:
+                    time.sleep(poll_interval)
+                    continue
+                if status.get("ok"):
+                    copied = 0
+                    for art in status.get("artifacts") or []:
+                        art_path = os.path.join(outbox, jid, os.path.basename(art))
+                        if os.path.isfile(art_path):
+                            os.makedirs(self.out_dir, exist_ok=True)
+                            shutil.copy2(art_path, self.out_dir)
+                            dest_art = os.path.join(self.out_dir, os.path.basename(art_path))
+                            self.artifacts.append(dest_art)
+                            copied += 1
+                    self.log(f"  ✓ farm worker completed {jid} ({copied} artifacts)")
+                    return
+                error = status.get("error") or "unknown farm worker failure"
+                raise RuntimeError(f"farm worker failed {jid}: {error}")
+
+            if os.path.isfile(failed_path):
+                try:
+                    with open(failed_path, encoding="utf-8") as f:
+                        rec = json.load(f)
+                except Exception:
+                    rec = {}
+                error = rec.get("error") or "unknown farm worker failure"
+                raise RuntimeError(f"farm worker failed {jid}: {error}")
+
+            time.sleep(poll_interval)
+
+        raise RuntimeError(
+            f"timed out waiting for farm worker for {jid} "
+            f"(outbox={outbox}). Ensure an arm64 Linux worker is online.")
+
+    def _dispatch_to_farm(self, target_ids):
+        """Submit farm job(s), wait for completion, and collect artifacts."""
+        pending = self._queue_farm_job(target_ids)
+        if pending:
+            self._wait_for_farm_job(*pending)
+
     # -- driver -------------------------------------------------------------
     def execute(self):
         start = time.time()
@@ -4422,23 +4608,38 @@ class Build:
             if self.dry_run:
                 self.log("** DRY RUN — commands are printed, nothing is executed **")
 
-            self._ensure_flutter()
-            self.checkout_source()
-            self._ensure_rust()
-            self._ensure_sccache()
-            self._ensure_llvm()
-            self.generate_bridge()
+            # Queue remote work first so it can run while local targets build.
+            farm_targets = self._farm_only_targets()
+            pending_farm = self._queue_farm_job(farm_targets)
 
-            plats = self.platforms_needed()
-            dispatch = {
-                "windows": self.build_windows,
-                "linux": self.build_linux,
-                "android": self.build_android,
-                "macos": self.build_macos,
-            }
-            for p in plats:
-                self._check_cancel()
-                dispatch[p]()
+            # Run remaining targets locally. If everything went to the farm,
+            # this host does not need a RustDesk checkout or local toolchains.
+            original_target_ids = self.target_ids
+            farm_set = set(farm_targets)
+            self.target_ids = [t for t in original_target_ids if t not in farm_set]
+            try:
+                if self.target_ids:
+                    self._ensure_flutter()
+                    self.checkout_source()
+                    self._ensure_rust()
+                    self._ensure_sccache()
+                    self._ensure_llvm()
+                    self.generate_bridge()
+                    plats = self.platforms_needed()
+                    dispatch = {
+                        "windows": self.build_windows,
+                        "linux": self.build_linux,
+                        "android": self.build_android,
+                        "macos": self.build_macos,
+                    }
+                    for p in plats:
+                        self._check_cancel()
+                        dispatch[p]()
+            finally:
+                self.target_ids = original_target_ids
+
+            if pending_farm:
+                self._wait_for_farm_job(*pending_farm)
 
             self._log_sccache_stats()
 
@@ -4469,7 +4670,9 @@ def preflight(target_ids, prereqs_status, host=None):
         if host["os"] not in t["host_os"]:
             problems.append(f"{t['label']}: needs a {' or '.join(t['host_os'])} host")
             continue
-        for tool in detect.required_tools(t, host["os"]):
+        farm_dispatch = (tid == "linux-aarch64-deb" and host["os"] == "Linux"
+                         and host.get("arch") != "aarch64")
+        for tool in ([] if farm_dispatch else detect.required_tools(t, host["os"])):
             st = prereqs_status.get(tool)
             if not st or not st.get("present"):
                 problems.append(f"{t['label']}: missing {tool}")
