@@ -187,6 +187,9 @@ TARGETS = [
     {"id": "linux-aarch64-deb", "platform": "linux", "arch": "aarch64",
      "label": "Linux arm64 — .deb", "ext": "deb", "host_os": ["Linux"],
      "note": "arm64 build. Native on an arm64 Linux host; dispatched to a farm worker on x86_64."},
+    {"id": "linux-x86_64-deb-drm", "platform": "linux", "arch": "x86_64",
+     "label": "Linux x86_64 (Unattended Wayland / DRM)", "ext": "deb", "host_os": ["Linux"],
+     "note": "Debian/Ubuntu package with unattended Wayland support."},
 
     # ---- Android (NDK) -> Linux or macOS ----
     # Windows is still blocked: MSYS2 Perl breaks openssl-sys. macOS uses the

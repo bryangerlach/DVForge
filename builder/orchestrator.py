@@ -2387,8 +2387,9 @@ class Build:
             os.environ["CXXFLAGS"] = (
                 (existing + " ") if existing else "") + "-include cstdint"
         self.log(f"  · CXXFLAGS={os.environ['CXXFLAGS']!r} (GCC 15+ compat)")
+        is_drm = any("drm" in t for t in self.target_ids)
         triplet = ("arm64-linux" if any(t.startswith("linux-aarch64")
-                                        for t in self.target_ids)
+                                       for t in self.target_ids)
                    else "x64-linux")
         self.setup_vcpkg(triplet)
         self.customize_for("linux")
@@ -2398,15 +2399,25 @@ class Build:
         env = self._env() if not self.dry_run else None
         if env is not None:
             customize.write_custom_txt(self.src_dir, env, log=self.log)
+        # Pre-build libdrmtap if building a DRM target
+        extra_env = {}
+        if is_drm:
+            drmtap_dir = self._build_libdrmtap()
+            if drmtap_dir:
+                extra_env["DRMTAP_PREBUILT_DIR"] = drmtap_dir
         # build.py auto-detects distro and calls build_flutter_deb on
         # Debian/Ubuntu. That's fine for .deb targets, but for .rpm and
         # .AppImage we need to package after the flutter build completes.
         linux_targets = [t for t in self.target_ids if t.startswith("linux-")]
-        wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb")
+        wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb", "linux-x86_64-drm")
                         for t in linux_targets)
         wants_rpm = "linux-x86_64-rpm" in linux_targets
         wants_appimage = "linux-x86_64-appimage" in linux_targets
-        self._build_linux_core()
+
+        # Run core build with drm features enabled if targeting drm
+        core_features = "drm,drm-wake" if is_drm else None
+        self._build_linux_core(extra_features=core_features, extra_env=extra_env or None)
+
         # Write custom_.txt into the flutter bundle BEFORE packaging. The .deb
         # copies this bundle, and appimage-builder subsequently extracts the .deb.
         bundle = self._linux_bundle_dir()
@@ -2422,19 +2433,60 @@ class Build:
         if wants_appimage:
             self._package_linux_appimage()
         self._collect(self.src_dir, (".deb", ".rpm", ".AppImage", ".flatpak",
-                                     ".pkg.tar.zst"), "linux")
+                                   ".pkg.tar.zst"), "linux")
 
-    def _build_linux_core(self):
+    def _build_linux_core(self, extra_features=None, extra_env=None):
         """Run cargo build + flutter build linux without packaging."""
         features = "flutter"
         if "hwcodec" in self.config.get("features", []):
             features += ",hwcodec"
+        if extra_features:
+            features += f",{extra_features}"
+
+        run_env = dict(os.environ)
+        if extra_env:
+            run_env.update(extra_env)
+
         self.run(["cargo", "build", "--locked", "--features", features,
                   "--lib", "--release"],
-                 cwd=self.src_dir, check=False)
+                 cwd=self.src_dir, check=False, env=run_env)
+        
         flutter_dir = os.path.join(self.src_dir, "flutter")
         self.run(["flutter", "build", "linux", "--release"],
-                 cwd=flutter_dir, check=False)
+                 cwd=flutter_dir, check=False, env=run_env)
+
+    def _build_libdrmtap(self):
+        """Build libdrmtap on the host using meson/ninja (host meson is newer)."""
+        self.log("\n=== Building libdrmtap for DRM support ===")
+        drmtap_src = os.path.join(self.src_dir, "third_party", "libdrmtap")
+        build_pkg = os.path.join(drmtap_src, "build-pkg")
+        
+        if not os.path.isdir(drmtap_src):
+            self.log("  ! third_party/libdrmtap not found in submodules")
+            return ""
+
+        if self.dry_run:
+            self.log(f"  (would build libdrmtap and output to {build_pkg})")
+            return build_pkg
+
+        # Install build tools on host if missing
+        self.run(["sudo", "apt-get", "update", "-y"], check=False)
+        self.run(["sudo", "apt-get", "install", "-y", "meson", "ninja-build", 
+                  "pkg-config", "libdrm-dev", "libegl1-mesa-dev", "libgles2-mesa-dev"], check=False)
+
+        try:
+            import importlib.util
+            bp = os.path.join(self.src_dir, "build.py")
+            spec = importlib.util.spec_from_file_location("build_script", bp)
+            b = importlib.util.module_from_spec(spec)
+            sys.argv = ["build.py"]
+            spec.loader.exec_module(b)
+            so_path = b.build_libdrmtap_so()
+            self.log(f"  ✓ built libdrmtap: {so_path}")
+            return build_pkg
+        except Exception as e:
+            self.log(f"  ! failed to build libdrmtap via build.py: {e}")
+            return ""
 
     def _linux_bundle_dir(self):
         """Return the Flutter bundle for the requested Linux architecture."""
