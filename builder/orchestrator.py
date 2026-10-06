@@ -2409,7 +2409,7 @@ class Build:
         # Debian/Ubuntu. That's fine for .deb targets, but for .rpm and
         # .AppImage we need to package after the flutter build completes.
         linux_targets = [t for t in self.target_ids if t.startswith("linux-")]
-        wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb", "linux-x86_64-drm")
+        wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb", "linux-x86_64-deb-drm")
                         for t in linux_targets)
         wants_rpm = "linux-x86_64-rpm" in linux_targets
         wants_appimage = "linux-x86_64-appimage" in linux_targets
