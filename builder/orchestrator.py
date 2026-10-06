@@ -2415,7 +2415,7 @@ class Build:
         wants_appimage = "linux-x86_64-appimage" in linux_targets
 
         # Run core build with drm features enabled if targeting drm
-        core_features = "drm,drm-wake" if is_drm else None
+        core_features = "drm" if is_drm else None
         self._build_linux_core(extra_features=core_features, extra_env=extra_env or None)
 
         # Write custom_.txt into the flutter bundle BEFORE packaging. The .deb
@@ -2456,14 +2456,23 @@ class Build:
                  cwd=flutter_dir, check=False, env=run_env)
 
     def _build_libdrmtap(self):
-        """Build libdrmtap on the host using meson/ninja (host meson is newer)."""
+        """Build libdrmtap on the host using meson/ninja, cloning it if missing."""
         self.log("\n=== Building libdrmtap for DRM support ===")
         drmtap_src = os.path.join(self.src_dir, "third_party", "libdrmtap")
         build_pkg = os.path.join(drmtap_src, "build-pkg")
-        
-        if not os.path.isdir(drmtap_src):
-            self.log("  ! third_party/libdrmtap not found in submodules")
-            return ""
+
+        # Since it's not a submodule, safely check out/clone the repository directly if missing
+        if not os.path.isdir(drmtap_src) or not os.listdir(drmtap_src) if os.path.isdir(drmtap_src) else True:
+            self.log("  · libdrmtap missing from third_party/ — cloning repository…")
+            if self.dry_run:
+                self.log(f"  (would clone https://github.com/rustdesk-org/libdrmtap.git into {drmtap_src})")
+                return build_pkg
+            else:
+                os.makedirs(os.path.dirname(drmtap_src), exist_ok=True)
+                if os.path.isdir(drmtap_src):
+                    shutil.rmtree(drmtap_src, ignore_errors=True)
+                self.run(["git", "clone", "https://github.com/rustdesk-org/libdrmtap.git", drmtap_src],
+                         cwd=self.src_dir, check=True)
 
         if self.dry_run:
             self.log(f"  (would build libdrmtap and output to {build_pkg})")
