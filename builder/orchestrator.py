@@ -2533,7 +2533,7 @@ class Build:
         deb_arch = ("arm64" if any(t.startswith("linux-aarch64")
                                   for t in self.target_ids) else "amd64")
         if is_drm:
-            self.run([self._py(), "build.py", "--flutter", "--drm", "--hwcodec", "--unix-file-copy-paste", "--skip-cargo"],
+            self.run([self._py(), "build.py", "--flutter", "--drm", "--skip-cargo"],
                      cwd=self.src_dir, env={"DEB_ARCH": deb_arch})
         else:
             self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
