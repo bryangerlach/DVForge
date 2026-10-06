@@ -2427,7 +2427,7 @@ class Build:
             self.log("  ! flutter linux bundle not found — custom_.txt not staged")
         # appimage-builder extracts from the .deb, so always build it first.
         if wants_deb or wants_appimage:
-            self._package_linux_deb()
+            self._package_linux_deb(is_drm)
         if wants_rpm:
             self._package_linux_rpm()
         if wants_appimage:
@@ -2452,12 +2452,8 @@ class Build:
                  cwd=self.src_dir, check=False, env=run_env)
         
         flutter_dir = os.path.join(self.src_dir, "flutter")
-        if extra_features and "drm" in extra_features:
-            self.run(["flutter", "build", "linux", "--drm", "--hwcodec", "--unix-file-copy-paste", "--release"],
-                    cwd=flutter_dir, check=False, env=run_env)
-        else:
-            self.run(["flutter", "build", "linux", "--release"],
-                cwd=flutter_dir, check=False, env=run_env)
+        self.run(["flutter", "build", "linux", "--release"],
+            cwd=flutter_dir, check=False, env=run_env)
 
     def _build_libdrmtap(self):
         """Build libdrmtap on the host using meson/ninja, cloning it if missing."""
@@ -2504,7 +2500,7 @@ class Build:
                               arch, "release", "bundle")
         return bundle if os.path.isdir(bundle) else None
 
-    def _package_linux_deb(self):
+    def _package_linux_deb(self, is_drm):
         """Package the flutter bundle into a .deb using build.py's logic."""
         self.log("  · packaging .deb")
         build_py = os.path.join(self.src_dir, "build.py")
@@ -2536,8 +2532,12 @@ class Build:
         # bundle are already built and custom_.txt is staged in that bundle.
         deb_arch = ("arm64" if any(t.startswith("linux-aarch64")
                                   for t in self.target_ids) else "amd64")
-        self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
-                 cwd=self.src_dir, env={"DEB_ARCH": deb_arch})
+        if is_drm:
+            self.run([self._py(), "build.py", "--flutter", "--drm", "--hwcodec", "--unix-file-copy-paste", "--skip-cargo"],
+                     cwd=self.src_dir, env={"DEB_ARCH": deb_arch})
+        else:
+            self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
+                     cwd=self.src_dir, env={"DEB_ARCH": deb_arch})
         if self.dry_run:
             return
         deb_path = os.path.join(self.src_dir, f"rustdesk-{self.version}.deb")
