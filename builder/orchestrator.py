@@ -2415,7 +2415,7 @@ class Build:
         wants_appimage = "linux-x86_64-appimage" in linux_targets
 
         # Run core build with drm features enabled if targeting drm
-        core_features = "drm" if is_drm else None
+        core_features = "drm,drm-wake" if is_drm else None
         self._build_linux_core(extra_features=core_features, extra_env=extra_env or None)
 
         # Write custom_.txt into the flutter bundle BEFORE packaging. The .deb
@@ -2452,8 +2452,12 @@ class Build:
                  cwd=self.src_dir, check=False, env=run_env)
         
         flutter_dir = os.path.join(self.src_dir, "flutter")
-        self.run(["flutter", "build", "linux", "--release"],
-                 cwd=flutter_dir, check=False, env=run_env)
+        if extra_features and "drm" in extra_features:
+            self.run(["flutter", "build", "linux", "--drm", "--hwcodec", "--unix-file-copy-paste", "--release"],
+                    cwd=flutter_dir, check=False, env=run_env)
+        else:
+            self.run(["flutter", "build", "linux", "--release"],
+                cwd=flutter_dir, check=False, env=run_env)
 
     def _build_libdrmtap(self):
         """Build libdrmtap on the host using meson/ninja, cloning it if missing."""
