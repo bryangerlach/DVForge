@@ -91,6 +91,7 @@ DEPS=(
     libasound2-dev libpulse-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
     libva-dev patchelf
     libffi-dev potrace
+    meson libdrm-dev libegl1-mesa-dev libgles2-mesa-dev
 )
 
 for compat_pkg in lib32z1 lib32ncurses6 lib32stdc++6; do

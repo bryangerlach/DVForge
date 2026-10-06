@@ -258,6 +258,16 @@ TOOLS = {
             "Linux":   ("sudo", ["apt", "install", "-y", "potrace"]),
         },
     },
+    # libdrmtap deps for unattended wayland builds
+    "libdrmtap_deps": {
+        "label": "libdrmtap build dependencies (meson, ninja, libdrm)",
+        "kind": "package",
+        "marker": "meson",
+        "packages": {
+            "Linux": ("sudo", ["apt-get", "install", "-y", "meson", "ninja-build", 
+                               "pkg-config", "libdrm-dev", "libegl1-mesa-dev", "libgles2-mesa-dev"]),
+        },
+    },
 }
 
 # which detection id each tool satisfies (prereqs.py ids)
@@ -266,7 +276,8 @@ SATISFIES = {"flutter": "flutter", "llvm": "llvm", "android_ndk": "android_ndk",
              "java": "java", "vcpkg": "vcpkg", "rust": "rust",
              "vs_buildtools": "msbuild", "nuget": "nuget", "dotnet": "dotnet",
              "sccache": "sccache",
-             "imagemagick": "imagemagick", "potrace": "potrace"}
+             "imagemagick": "imagemagick", "potrace": "potrace",
+             "libdrmtap_deps": "libdrmtap_deps"}
 
 
 def tools_dir(root):
@@ -447,6 +458,8 @@ def installable(host_os=None, host_arch=None):
                 ok, reason = False, "Rust/cargo is required to install this"
         elif spec["kind"] == "package":
             pkgs = spec.get("packages", {})
+            if tid == "libdrmtap_deps" and host_os != "Linux":
+                ok, reason = False, "libdrmtap dependencies are Linux-only"
             if (host_os, ) not in {(k[0],) for k in pkgs} and host_os not in pkgs:
                 ok, reason = False, f"no package install for {host_os}"
             elif host_os in pkgs:

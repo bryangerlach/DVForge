@@ -2478,11 +2478,6 @@ class Build:
             self.log(f"  (would build libdrmtap and output to {build_pkg})")
             return build_pkg
 
-        # Install build tools on host if missing
-        self.run(["sudo", "apt-get", "update", "-y"], check=False)
-        self.run(["sudo", "apt-get", "install", "-y", "meson", "ninja-build", 
-                  "pkg-config", "libdrm-dev", "libegl1-mesa-dev", "libgles2-mesa-dev"], check=False)
-
         try:
             import importlib.util
             bp = os.path.join(self.src_dir, "build.py")
