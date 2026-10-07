@@ -2541,8 +2541,6 @@ class Build:
 
         if is_drm:
             drm_args = [self._py(), "build.py", "--flutter", "--drm", "--skip-cargo"]
-            if "hwcodec" in self.config.get("features", []):
-                drm_args.append("--hwcodec")
             self.run(drm_args, cwd=self.src_dir, env=run_env)
         else:
             self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
