@@ -2540,15 +2540,16 @@ class Build:
             run_env.update(extra_env)
 
         if is_drm:
-            self.run([self._py(), "build.py", "--flutter", "--drm"],
+            self.run([self._py(), "build.py", "--flutter", "--drm", "--hwcodec", "--unix-file-copy-paste", "--skip-cargo"],
                      cwd=self.src_dir, env=run_env)
+            deb_path = os.path.join(self.src_dir, f"rustdesk-unattended-wayland-{self.version}.deb")
         else:
             self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
                      cwd=self.src_dir, env=run_env)
+            deb_path = os.path.join(self.src_dir, f"rustdesk-{self.version}.deb")
 
         if self.dry_run:
-            return
-        deb_path = os.path.join(self.src_dir, f"rustdesk-{self.version}.deb")
+            return            
         if not os.path.isfile(deb_path):
             raise RuntimeError("Linux .deb packaging did not produce an artifact")
         bundle = self._linux_bundle_dir()
