@@ -802,6 +802,37 @@ def check_cocoapods():
                        note="Required by 'flutter build macos'.")
     return _status(False, hint=_install_hint("cocoapods"))
 
+def check_libdrmtap_deps():
+    """Detect if meson, ninja, and libdrm/EGL/GLES headers are installed."""
+    if _system() != "Linux":
+        return _status(False, note="Linux only (Unattended Wayland / DRM).")
+    
+    # Check binaries
+    has_meson = bool(_which("meson"))
+    has_ninja = bool(_which("ninja"))
+    
+    # Check common header paths for libdrm and Mesa EGL/GLES
+    header_checks = [
+        os.path.exists("/usr/include/libdrm/drm.h") or os.path.exists("/usr/local/include/libdrm/drm.h"),
+        os.path.exists("/usr/include/EGL/egl.h") or os.path.exists("/usr/local/include/EGL/egl.h"),
+        os.path.exists("/usr/include/GLES2/gl2.h") or os.path.exists("/usr/local/include/GLES2/gl2.h")
+    ]
+    has_headers = all(header_checks)
+
+    if has_meson and has_ninja and has_headers:
+        return _status(True, "installed", note="meson, ninja, and libdrm/EGL headers present.")
+    
+    missing = []
+    if not has_meson: missing.append("meson")
+    if not has_ninja: missing.append("ninja")
+    if not has_headers: missing.append("libdrm-dev / libegl1-mesa-dev / libgles2-mesa-dev headers")
+    
+    return _status(
+        False, 
+        note=f"Missing dependencies: {', '.join(missing)}",
+        hint=_install_hint("libdrmtap_deps")
+    )
+
 
 CHECKS = {
     "git": check_git,
@@ -831,6 +862,7 @@ CHECKS = {
     "pkgconfig": check_pkgconfig,
     "create_dmg": check_create_dmg,
     "cocoapods": check_cocoapods,
+    "libdrmtap_deps": check_libdrmtap_deps,
 }
 
 LABELS = {
@@ -861,6 +893,7 @@ LABELS = {
     "pkgconfig": "pkg-config (native library discovery)",
     "create_dmg": "create-dmg (macOS .dmg packaging)",
     "cocoapods": "CocoaPods (flutter build macos)",
+    "libdrmtap_deps": "libdrmtap build dependencies (meson, ninja, libdrm)",
 }
 
 
@@ -999,6 +1032,9 @@ def _install_hint(tool):
         },
         "cocoapods": {
             "macOS": "brew install cocoapods  or: sudo gem install cocoapods",
+        },
+        "libdrmtap_deps": {
+            "Linux": "sudo apt install -y meson ninja-build pkg-config libdrm-dev libegl1-mesa-dev libgles2-mesa-dev",
         },
     }
     return hints.get(tool, {}).get(os_name, "")
