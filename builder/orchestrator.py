@@ -2540,8 +2540,8 @@ class Build:
             run_env.update(extra_env)
 
         if is_drm:
-            drm_args = [self._py(), "build.py", "--flutter", "--drm", "--skip-cargo"]
-            self.run(drm_args, cwd=self.src_dir, env=run_env)
+            self.run([self._py(), "build.py", "--flutter", "--drm"],
+                     cwd=self.src_dir, env=run_env)
         else:
             self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
                      cwd=self.src_dir, env=run_env)
