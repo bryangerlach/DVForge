@@ -2411,7 +2411,6 @@ class Build:
                 extra_env["DRMTAP_PREBUILT_DIR"] = drmtap_dir
 
         linux_targets = [t for t in self.target_ids if t.startswith("linux-")]
-        # Ensure this matches your exact target ID string from detect.py
         wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb", "linux-x86_64-deb-drm")
                         for t in linux_targets)
         wants_rpm = "linux-x86_64-rpm" in linux_targets
@@ -2434,7 +2433,7 @@ class Build:
         if wants_appimage:
             self._package_linux_appimage()
         self._collect(self.src_dir, (".deb", ".rpm", ".AppImage", ".flatpak",
-                                   ".pkg.tar.zst"), "linux")
+                                     ".pkg.tar.zst"), "linux")
 
     def _build_linux_core(self, extra_features=None, extra_env=None):
         """Run cargo build + flutter build linux without packaging."""
@@ -2531,9 +2530,10 @@ class Build:
             with open(build_py, "w", encoding="utf-8", errors="surrogateescape") as f:
                 f.write(text)
             self.log("  · patched build.py to package custom_.txt")
-
+        # Delegate to build.py with --skip-cargo; the native library and Flutter
+        # bundle are already built and custom_.txt is staged in that bundle.
         deb_arch = ("arm64" if any(t.startswith("linux-aarch64")
-                                   for t in self.target_ids) else "amd64")
+                                  for t in self.target_ids) else "amd64")
         
         run_env = {"DEB_ARCH": deb_arch}
         if extra_env:
