@@ -2378,23 +2378,31 @@ class Build:
 
     def build_linux(self):
         self.log("\n=== Build Linux ===")
+        # GCC 15+ (Ubuntu 26.04+) requires explicit #include <cstdint> for
+        # uint8_t etc. in C++ sources that relied on transitive includes.
+        # Force-include it globally so vcpkg/RustDesk C++ builds compile
+        # without manually patching every upstream file.
         existing = os.environ.get("CXXFLAGS", "")
         if "-include cstdint" not in existing:
             os.environ["CXXFLAGS"] = (
                 (existing + " ") if existing else "") + "-include cstdint"
         self.log(f"  · CXXFLAGS={os.environ['CXXFLAGS']!r} (GCC 15+ compat)")
-        
         is_drm = any("drm" in t for t in self.target_ids)
         triplet = ("arm64-linux" if any(t.startswith("linux-aarch64")
-                                       for t in self.target_ids)
+                                        for t in self.target_ids)
                    else "x64-linux")
         self.setup_vcpkg(triplet)
         self.customize_for("linux")
+        # BINARY_NAME change poisons CMakeCache the same way Windows does.
         self._invalidate_stale_flutter_linux()
+        # base64 custom_.txt staged for build.py + bundle (SKILL.md §4.4)
         
         env = self._env() if not self.dry_run else None
         if env is not None:
             customize.write_custom_txt(self.src_dir, env, log=self.log)
+        # build.py auto-detects distro and calls build_flutter_deb on
+        # Debian/Ubuntu. That's fine for .deb targets, but for .rpm and
+        # .AppImage we need to package after the flutter build completes.
 
         extra_env = {}
         if is_drm:
@@ -2404,20 +2412,21 @@ class Build:
 
         linux_targets = [t for t in self.target_ids if t.startswith("linux-")]
         # Ensure this matches your exact target ID string from detect.py
-        wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb", "linux-x86_64-drm")
+        wants_deb = any(t in ("linux-x86_64-deb", "linux-aarch64-deb", "linux-x86_64-deb-drm")
                         for t in linux_targets)
         wants_rpm = "linux-x86_64-rpm" in linux_targets
         wants_appimage = "linux-x86_64-appimage" in linux_targets
 
         core_features = "drm,drm-wake" if is_drm else None
         self._build_linux_core(extra_features=core_features, extra_env=extra_env or None)
-
+        # Write custom_.txt into the flutter bundle BEFORE packaging. The .deb
+        # copies this bundle, and appimage-builder subsequently extracts the .deb.
         bundle = self._linux_bundle_dir()
         if env is not None and bundle:
             customize.write_custom_txt(bundle, env, log=self.log)
         elif env is not None and not self.dry_run:
             self.log("  ! flutter linux bundle not found — custom_.txt not staged")
-
+        # appimage-builder extracts from the .deb, so always build it first.
         if wants_deb or wants_appimage:
             self._package_linux_deb(is_drm, extra_env=extra_env)
         if wants_rpm:
@@ -2445,15 +2454,8 @@ class Build:
         
         flutter_dir = os.path.join(self.src_dir, "flutter")
         
-        build_py_args = [self._py(), "build.py", "--flutter", "--skip-cargo"]
-        if extra_features and "drm" in extra_features:
-            build_py_args.append("--drm")
-            if "hwcodec" in self.config.get("features", []):
-                build_py_args.append("--hwcodec")
-            if "unix-file-copy-paste" in features:
-                build_py_args.append("--unix-file-copy-paste")
-
-        self.run(build_py_args, cwd=self.src_dir, check=False, env=run_env)
+        self.run(["flutter", "build", "linux", "--release"],
+             cwd=flutter_dir, check=False)
 
     def _build_libdrmtap(self):
         """Build libdrmtap on the host using meson/ninja, cloning it if missing."""
