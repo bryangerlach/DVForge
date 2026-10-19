@@ -1211,6 +1211,60 @@ def _apply_logo(src, env, platform, log):
                 shutil.copy2(src_f, os.path.join(fa2, fname))
 
 
+def _apply_app_version(src, env, log):
+    """Override the Cargo.toml package version when config sets app_version.
+
+    Mirrors: sed -i -e 's|^version = ".*"|version = "<app_version>"|' ./Cargo.toml
+
+    A blank/unset app_version leaves Cargo.toml untouched.
+    """
+    app_version = (env.get("CUSTOM_APP_VERSION") or "").strip()
+    if not app_version:
+        return
+    log(f"  Cargo.toml version -> {app_version}")
+    sed_regex(
+        src, "Cargo.toml",
+        r'^version = ".*"',
+        lambda _m: f'version = "{app_version}"',
+        log,
+        flags=re.MULTILINE,
+    )
+
+
+def _apply_custom_update(src, patches_dir, env, log):
+    """Apply self-hosted auto-update support via patches/allow_custom_update.py.
+
+    Only runs when CUSTOM_APP_VERSION is set and non-empty — that is the
+    signal that this is a custom/self-hosted release rather than stock RustDesk.
+
+    Mirrors:
+        python patches/allow_custom_update.py \
+            --rustdesk-root <src> \
+            --update-url <apiServer>/api/version/latest \
+            --ed25519-public-key <upload_public_key>
+    """
+    app_version = (env.get("CUSTOM_APP_VERSION") or "").strip()
+    if not app_version:
+        return
+    script = os.path.join(patches_dir, "allow_custom_update.py")
+    if not os.path.exists(script):
+        log("  ! allow_custom_update.py not found — skipping self-hosted update patch")
+        return
+    api_server = (env.get("CUSTOM_API_SERVER") or "").strip().rstrip("/")
+    update_url = f"{api_server}/api/version/latest" if api_server else ""
+    public_key = (env.get("CUSTOM_UPLOAD_PUBLIC_KEY") or "").strip()
+    cmd = [sys.executable, script, "--rustdesk-root", src, "--update-url", update_url]
+    if public_key:
+        cmd += ["--ed25519-public-key", public_key]
+    log(f"  Self-hosted updates -> {update_url}")
+    try:
+        subprocess.run(cmd, cwd=src, check=True, capture_output=True, text=True)
+        log("    · allow_custom_update.py applied")
+    except subprocess.CalledProcessError as e:
+        log(f"    ! allow_custom_update.py failed: "
+            f"{(e.stderr or e.stdout or '').strip()[:200]}")
+
+
 # ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
@@ -1368,6 +1422,8 @@ def apply(src_dir, platform, env, patches_dir, log=print):
         _apply_windows_build_fix(src_dir, log)
         _force_windows_install_prefix(src_dir, log)
     _apply_appname(src_dir, env, platform, log)
+    _apply_app_version(src_dir, env, log)
+    _apply_custom_update(src_dir, patches_dir, env, log)
     if platform == "windows":
         _apply_printer_port(src_dir, env, log)
     _apply_company(src_dir, env, platform, log)

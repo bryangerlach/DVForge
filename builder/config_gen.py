@@ -311,6 +311,8 @@ def build_custom_env(cfg: dict) -> dict:
     appname = d.get("appname", d.get("exename", "RustDesk"))
     filename = d.get("exename", appname)
     compname = d.get("compname", "")
+    app_version = d.get("app_version", "") or ""
+    upload_public_key = d.get("upload_public_key", "") or ""
     server = d.get("serverIP", "rs-ny.rustdesk.com")
     key = d.get("key", "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=")
     api = d.get("apiServer", "")
@@ -333,6 +335,8 @@ def build_custom_env(cfg: dict) -> dict:
     env = {
         "CUSTOM_APPNAME": appname,
         "CUSTOM_FILENAME": filename,
+        "CUSTOM_APP_VERSION": app_version,
+        "CUSTOM_UPLOAD_PUBLIC_KEY": upload_public_key,
         "CUSTOM_COMPNAME": compname,
         "CUSTOM_SERVER": server,
         "CUSTOM_KEY": key,

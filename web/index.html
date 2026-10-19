@@ -139,6 +139,13 @@
             <label>Company<input data-key="compname"></label>
             <label>Slogan<input data-key="slogan" placeholder="blank = Powered by {appname}"></label>
             <label>Android app id<input data-key="androidappid" placeholder="com.yourbrand.client" spellcheck="false"></label>
+            <label>App version<input data-key="app_version" placeholder="blank = keep Cargo.toml version"></label>
+            <label>Update public key<input data-key="upload_public_key" placeholder="ed25519 public key (base64/hex) for update verification" spellcheck="false"></label>
+            <p class="theme-live-hint">When set, overrides the <code>version = "…"</code> line in
+              Cargo.toml before the build (e.g. <code>2.0.0</code>). Blank leaves it unchanged.</p>
+            <p class="theme-live-hint">When app version is set, patches/allow_custom_update.py is run with
+              <code>--update-url</code> = API server + <code>/api/version/latest</code> and
+              <code>--ed25519-public-key</code> = this key, so the client verifies self-hosted updates.</p>
             <p class="theme-live-hint">Installed identity on the phone. Must not be
               <code>com.carriez.flutter_hbb</code> or this APK cannot sit beside official
               RustDesk. Blank is filled from app + company name on save/build.</p>
