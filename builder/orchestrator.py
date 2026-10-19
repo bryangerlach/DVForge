@@ -64,8 +64,8 @@ VERSION_PROFILES = {
     },
     "1.5.0": {
         "vcpkg_commit": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
-        "label": "1.5.0 (latest, from master)",
-        "git_ref": "master",
+        "label": "1.5.0",
+        "git_ref": "1.5.0",
     },
 }
 # Fallback for versions not in the table — use the newest known profile.
