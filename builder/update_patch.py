@@ -20,6 +20,11 @@ What it changes:
        - relax the GitHub-only download host check
   4. src/update_metadata.rs
        - add the server's ed25519 public key to TRUSTED_UPDATE_KEYS
+  5. Flutter sources
+       - remove the is_custom_client() gates around the startup check, the
+         update card/banner and the "check on startup" toggles
+       - open the release page returned by the update server where no
+         in-place updater exists
 
 The matching server contract is implemented by rustdesk-api:
 
@@ -208,6 +213,164 @@ def _modify_get_version_number(root, log):
     if _replace(target, _GET_VERSION_TEST_OLD, _GET_VERSION_TEST_NEW, 1):
         log("    · hbb_common: test_get_version_number() updated")
     return True
+
+
+def _normalize_update_platform(root, log):
+    """Report the platform name instead of a Linux distribution id.
+
+    version_check_request() uses System::distribution_id(), which on Linux is
+    the /etc/os-release ID ("ubuntu", "debian", ...). rustdesk-api keys update
+    metadata on "linux", so those checks would be rejected. Windows, macOS and
+    Android already report std::env::consts::OS.
+    """
+    target = os.path.join(root, "libs", "hbb_common", "src", "lib.rs")
+    if not os.path.isfile(target):
+        _warn(log, "libs/hbb_common/src/lib.rs not found — update platform "
+                   "not normalized")
+        return False
+    if "let os = std::env::consts::OS.to_string();" in _read(target):
+        return True
+    if _replace(target, "let os = system.distribution_id();",
+                "let os = std::env::consts::OS.to_string();", 1):
+        log("    · hbb_common: update checks report the platform name")
+        return True
+    _warn(log, "could not find distribution_id() assignment to normalize")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Flutter sources: remove the is_custom_client() gates around updates
+# ---------------------------------------------------------------------------
+
+def _replace_gate_before(path, marker, old, new, label, log):
+    """Replace the last `old` appearing before `marker` in `path`."""
+    if not os.path.isfile(path):
+        _warn(log, f"{path} not found — {label} not enabled")
+        return False
+    text = _read(path)
+    marker_idx = text.rfind(marker)
+    if marker_idx < 0:
+        _warn(log, f"could not find {label} marker in {path}")
+        return False
+    gate_idx = text.rfind(old, 0, marker_idx)
+    if gate_idx < 0:
+        # Already patched (source tree reused for another platform).
+        if text.rfind(new, 0, marker_idx) >= 0:
+            return True
+        _warn(log, f"could not find {label} gate in {path}")
+        return False
+    _write(path, text[:gate_idx] + new + text[gate_idx + len(old):])
+    log(f"    · {label}")
+    return True
+
+
+def _patch_flutter_update_gates(root, log):
+    """Remove the Flutter-side is_custom_client() gates around updates.
+
+    Removing the Rust guard in check_software_update() is not enough: the Dart
+    caller only invokes mainGetSoftwareUpdateUrl() when bind.isCustomClient()
+    is false, so a custom-branded client never contacts the update server at
+    all. The update card, the mobile banner and the "check on startup" toggles
+    are gated the same way.
+    """
+    ok = True
+    flutter = os.path.join(root, "flutter", "lib")
+
+    # Startup check: common.dart checkUpdate()
+    target = os.path.join(flutter, "common.dart")
+    if not os.path.isfile(target):
+        _warn(log, "flutter/lib/common.dart not found — startup update check "
+                   "not enabled")
+        ok = False
+    else:
+        text = _read(target)
+        pattern = (r"(void\s+checkUpdate\(\)\s*\{\s*if\s*\(!isWeb\)\s*\{\s*)"
+                   r"if\s*\(!bind\.isCustomClient\(\)\)\s*\{")
+        new_text, n = re.subn(pattern, r"\1if (true) {", text, count=1)
+        if n:
+            _write(target, new_text)
+            log("    · common.dart: startup update check enabled")
+        elif not re.search(
+                r"void\s+checkUpdate\(\)\s*\{\s*if\s*\(!isWeb\)\s*\{\s*"
+                r"if\s*\(true\)\s*\{", text):
+            _warn(log, "could not find the startup update check gate in "
+                       "flutter/lib/common.dart")
+            ok = False
+
+    # Desktop update card: desktop_home_page.dart buildHelpCards()
+    target = os.path.join(flutter, "desktop", "pages", "desktop_home_page.dart")
+    if not os.path.isfile(target):
+        _warn(log, "flutter/lib/desktop/pages/desktop_home_page.dart not "
+                   "found — desktop update card not enabled")
+        ok = False
+    else:
+        text = _read(target)
+        pattern = (r"if\s*\(!bind\.isCustomClient\(\)\s*&&\s*"
+                   r"updateUrl\.isNotEmpty\s*&&\s*!isCardClosed\s*&&\s*"
+                   r"bind\.mainUriPrefixSync\(\)\.contains\('rustdesk'\)\)")
+        new_text, n = re.subn(
+            pattern, "if (updateUrl.isNotEmpty && !isCardClosed)",
+            text, count=1)
+        if n:
+            _write(target, new_text)
+            log("    · desktop_home_page.dart: update card enabled")
+        elif "if (updateUrl.isNotEmpty && !isCardClosed)" not in text:
+            _warn(log, "could not find the update card gate in "
+                       "flutter/lib/desktop/pages/desktop_home_page.dart")
+            ok = False
+
+    # Mobile update banner
+    if not _replace_gate_before(
+            os.path.join(flutter, "mobile", "pages", "connection_page.dart"),
+            "_buildUpdateUI", "if (!bind.isCustomClient() && !isIOS)",
+            "if (!isIOS)", "connection_page.dart: mobile update banner enabled",
+            log):
+        ok = False
+
+    # Desktop "Check for software update on startup" toggle
+    if not _replace_gate_before(
+            os.path.join(flutter, "desktop", "pages", "desktop_setting_page.dart"),
+            "kOptionEnableCheckUpdate",
+            "if (!isWeb && !bind.isCustomClient())", "if (!isWeb)",
+            "desktop_setting_page.dart: update toggle enabled", log):
+        ok = False
+
+    # Mobile "Check for software update on startup" toggle
+    if not _replace_gate_before(
+            os.path.join(flutter, "mobile", "pages", "settings_page.dart"),
+            "kOptionEnableCheckUpdate", "if (!bind.isCustomClient()) {",
+            "if (true) {", "settings_page.dart: update toggle enabled", log):
+        ok = False
+
+    # Platforms without an in-place updater open the release page returned by
+    # the update server, so the user can pick the package for their distro/arch.
+    for rel, old, new, label in (
+        (os.path.join("desktop", "pages", "desktop_home_page.dart"),
+         "final Uri url = Uri.parse('https://rustdesk.com/download');",
+         "final Uri url = Uri.parse(updateUrl);",
+         "desktop_home_page.dart: release button opens the update server"),
+        (os.path.join("mobile", "pages", "connection_page.dart"),
+         "final url = 'https://rustdesk.com/download';",
+         "final url = updateUrl;",
+         "connection_page.dart: release button opens the update server"),
+    ):
+        target = os.path.join(flutter, rel)
+        if not os.path.isfile(target):
+            _warn(log, f"flutter/lib/{rel} not found — release button not "
+                       "retargeted")
+            ok = False
+            continue
+        text = _read(target)
+        if new in text:
+            continue
+        if _replace(target, old, new, 1):
+            log(f"    · {label}")
+        else:
+            _warn(log, f"could not find the static release URL in "
+                       f"flutter/lib/{rel}")
+            ok = False
+
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -458,12 +621,16 @@ def apply_custom_update(src_dir, update_url, public_key, log=print):
         warnings.append("update URL not changed")
     if not _modify_get_version_number(root, log):
         warnings.append("get_version_number() not patched")
+    if not _normalize_update_platform(root, log):
+        warnings.append("update platform not normalized")
     if not _allow_updates_for_custom_clients(root, log):
         warnings.append("custom-client update guard not removed")
     if not _relax_common_host_check(root, log):
         warnings.append("release URL host check not relaxed")
     if not _modify_display_version(root, log):
         warnings.append("release-id build metadata not accepted")
+    if not _patch_flutter_update_gates(root, log):
+        warnings.append("Flutter update gates not patched")
     if not _relax_artifact_host_check(root, log):
         warnings.append("artifact download host check not relaxed")
     if not _retarget_artifact_base(root, update_url, log):
