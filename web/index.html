@@ -234,6 +234,11 @@
             <legend>Links</legend>
             <label>Custom URL for links (replaces https://rustdesk.com)<input data-key="urlLink" placeholder="https://rustdesk.com"></label>
             <label>Custom URL for downloading updates (replaces https://rustdesk.com/download)<input data-key="downloadLink" placeholder="https://rustdesk.com/download"></label>
+            <label>Update public key (injected by rustdesk-api)<input data-key="update_public_key" placeholder="base64 ed25519 key" spellcheck="false"></label>
+            <label>Update check URL<input data-key="update_url" placeholder="blank = download URL + /api/version/latest" spellcheck="false"></label>
+            <p class="theme-live-hint">Set the public key to build a client that verifies
+              signed updates from your rustdesk-api server. rustdesk-api fills both
+              fields automatically when it starts a build.</p>
           </fieldset>
 
           <fieldset>

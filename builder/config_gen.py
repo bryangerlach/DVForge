@@ -318,6 +318,19 @@ def build_custom_env(cfg: dict) -> dict:
         api = f"https://{server}/"
     url_link = d.get("urlLink", "") or "https://rustdesk.com"
     download_link = d.get("downloadLink", "") or "https://rustdesk.com/download"
+    update_public_key = (d.get("update_public_key") or "").strip()
+    app_version = (d.get("app_version") or "").strip()
+    # Self-hosted update check. rustdesk-api injects `downloadLink` (its own
+    # base URL) plus `update_public_key`; an explicit `update_url` always wins.
+    update_url = (d.get("update_url") or "").strip()
+    if not update_url and update_public_key and download_link:
+        if download_link.rstrip("/") != "https://rustdesk.com/download":
+            update_url = download_link.rstrip("/") + "/api/version/latest"
+    # A client that verifies self-hosted updates must keep checking for them:
+    # "remove new version notification" would disable the update flow entirely.
+    remove_new_version_notif = d.get("removeNewVersionNotif", False)
+    if update_public_key:
+        remove_new_version_notif = False
     android_app_id = resolve_android_app_id(
         d.get("androidappid", "") or "", appname, compname)
     slogan = d.get("slogan", "") or ""
@@ -339,6 +352,9 @@ def build_custom_env(cfg: dict) -> dict:
         "CUSTOM_API_SERVER": api,
         "CUSTOM_URL_LINK": url_link,
         "CUSTOM_DOWNLOAD_LINK": download_link,
+        "CUSTOM_UPDATE_URL": update_url,
+        "CUSTOM_UPDATE_PUBLIC_KEY": update_public_key,
+        "CUSTOM_APP_VERSION": app_version,
         "CUSTOM_ANDROID_APP_ID": android_app_id,
         "CUSTOM_SLOGAN": slogan,
         "CUSTOM_ICON_FILE": icon_file,
@@ -352,7 +368,7 @@ def build_custom_env(cfg: dict) -> dict:
         "CUSTOM_DELAY_FIX": _b(d.get("delayFix", False)),
         "CUSTOM_HIDE_CM": _b(d.get("hidecm", False)),
         "CUSTOM_X_OFFLINE": _b(d.get("xOffline", False)),
-        "CUSTOM_REMOVE_NEW_VERSION_NOTIF": _b(d.get("removeNewVersionNotif", False)),
+        "CUSTOM_REMOVE_NEW_VERSION_NOTIF": _b(remove_new_version_notif),
     }
 
     # ---- permissions / custom.txt payload ----
