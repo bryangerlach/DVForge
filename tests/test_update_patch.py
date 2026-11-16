@@ -52,6 +52,7 @@ class SourcePatchTests(unittest.TestCase):
         os.makedirs(os.path.join(self.root, "src", "updater"))
         self._write("libs/hbb_common/src/lib.rs",
                     'const URL: &str = "https://api.rustdesk.com/version/latest";\n\n'
+                    "let os = system.distribution_id();\n\n"
                     + update_patch._GET_VERSION_OLD + "\n\n"
                     + update_patch._GET_VERSION_TEST_OLD + "\n")
         self._write("src/common.rs",
@@ -84,6 +85,52 @@ class SourcePatchTests(unittest.TestCase):
         self._write("Cargo.toml", '[package]\nname = "rustdesk"\nversion = "1.5.1"\n')
         self._write("Cargo.lock",
                     '[[package]]\nname = "rustdesk"\nversion = "1.5.1"\n')
+        self._write("flutter/lib/common.dart",
+                    "void checkUpdate() {\n"
+                    "  if (!isWeb) {\n"
+                    "    if (!bind.isCustomClient()) {\n"
+                    "      platformFFI.registerEventHandler(\n"
+                    "          kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,\n"
+                    "          (Map<String, dynamic> evt) async {});\n"
+                    "      bind.mainGetSoftwareUpdateUrl();\n"
+                    "    }\n"
+                    "  }\n"
+                    "}\n")
+        self._write("flutter/lib/desktop/pages/desktop_home_page.dart",
+                    "  Widget buildHelpCards(String updateUrl) {\n"
+                    "    if (!bind.isCustomClient() &&\n"
+                    "        updateUrl.isNotEmpty &&\n"
+                    "        !isCardClosed &&\n"
+                    "        bind.mainUriPrefixSync().contains('rustdesk')) {\n"
+                    "      final Uri url = "
+                    "Uri.parse('https://rustdesk.com/download');\n"
+                    "    }\n"
+                    "  }\n")
+        self._write("flutter/lib/mobile/pages/connection_page.dart",
+                    "          if (!bind.isCustomClient() && !isIOS)\n"
+                    "            Obx(() => _buildUpdateUI("
+                    "stateGlobal.updateUrl.value)),\n"
+                    "      final url = 'https://rustdesk.com/download';\n")
+        self._write("flutter/lib/desktop/pages/desktop_setting_page.dart",
+                    "      if (!isWeb && !bind.isCustomClient())\n"
+                    "        _OptionCheckBox(\n"
+                    "          context,\n"
+                    "          'Check for software update on startup',\n"
+                    "          kOptionEnableCheckUpdate,\n"
+                    "          isServer: false,\n"
+                    "        ),\n")
+        self._write("flutter/lib/mobile/pages/settings_page.dart",
+                    "    if (!bind.isCustomClient()) {\n"
+                    "      enhancementsTiles.add(\n"
+                    "        SettingsTile.switchTile(\n"
+                    "          initialValue: _checkUpdateOnStartup,\n"
+                    "          onToggle: (bool toValue) async {\n"
+                    "            await mainSetLocalBoolOption("
+                    "kOptionEnableCheckUpdate, toValue);\n"
+                    "          },\n"
+                    "        ),\n"
+                    "      );\n"
+                    "    }\n")
         self.key = "q83vASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4k="
 
     def tearDown(self):
@@ -109,6 +156,8 @@ class SourcePatchTests(unittest.TestCase):
         self.assertIn("https://api.example.com/api/version/latest", lib)
         self.assertNotIn("https://api.rustdesk.com/version/latest", lib)
         self.assertIn("split_once('+')", lib)
+        self.assertIn("std::env::consts::OS.to_string()", lib)
+        self.assertNotIn("system.distribution_id()", lib)
 
         common = self._read("src/common.rs")
         self.assertNotIn("is_custom_client() {\n        return;", common)
@@ -123,6 +172,33 @@ class SourcePatchTests(unittest.TestCase):
         metadata = self._read("src/update_metadata.rs")
         self.assertIn('key_id: "custom-update"', metadata)
         self.assertIn("171, 205, 239, 1, 35, 69, 103, 137", metadata)
+
+        # Flutter-side gates: without these a custom client never even asks
+        # the update server for a version.
+        common = self._read("flutter/lib/common.dart")
+        self.assertIn("if (true) {", common)
+        self.assertNotIn("!bind.isCustomClient()", common)
+
+        home = self._read("flutter/lib/desktop/pages/desktop_home_page.dart")
+        self.assertIn("if (updateUrl.isNotEmpty && !isCardClosed)", home)
+        self.assertNotIn("!bind.isCustomClient()", home)
+        self.assertIn("Uri.parse(updateUrl)", home)
+        self.assertNotIn("Uri.parse('https://rustdesk.com/download')", home)
+
+        mobile = self._read("flutter/lib/mobile/pages/connection_page.dart")
+        self.assertIn("if (!isIOS)", mobile)
+        self.assertNotIn("!bind.isCustomClient()", mobile)
+        self.assertIn("final url = updateUrl;", mobile)
+
+        desktop_settings = self._read(
+            "flutter/lib/desktop/pages/desktop_setting_page.dart")
+        self.assertIn("if (!isWeb)", desktop_settings)
+        self.assertNotIn("!bind.isCustomClient()", desktop_settings)
+
+        mobile_settings = self._read(
+            "flutter/lib/mobile/pages/settings_page.dart")
+        self.assertIn("if (true) {", mobile_settings)
+        self.assertNotIn("!bind.isCustomClient()", mobile_settings)
 
         # Re-applying to a reused source tree (multi-platform job) is a no-op.
         self.assertEqual(update_patch.apply_custom_update(
