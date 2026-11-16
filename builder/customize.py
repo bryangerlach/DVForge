@@ -23,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 
+from . import update_patch
+
 
 # ---------------------------------------------------------------------------
 # small helpers (sed / patch equivalents)
@@ -735,6 +737,35 @@ def _apply_flags(src, env, patches_dir, log):
             log("    · removeNewVersionNotif")
 
 
+def _apply_app_version(src, env, log):
+    app_version = (env.get("CUSTOM_APP_VERSION") or "").strip()
+    if not app_version:
+        return
+    if update_patch.apply_app_version(src, app_version, log):
+        log(f"  App version -> {app_version}")
+
+
+def _apply_self_hosted_update(src, env, log):
+    """Add the self-hosted update key/URL patched into the RustDesk source.
+
+    Triggered by `update_public_key` in the client config. rustdesk-api injects
+    that key (and the matching URL) for every build so clients can verify the
+    signed metadata served by its /api/version/latest endpoint.
+    """
+    public_key = (env.get("CUSTOM_UPDATE_PUBLIC_KEY") or "").strip()
+    if not public_key:
+        return
+    update_url = (env.get("CUSTOM_UPDATE_URL") or "").strip()
+    if not update_url:
+        log("  ! update_public_key set but no update URL — set downloadLink "
+            "(or update_url) to the rustdesk-api base; self-hosted updates "
+            "were NOT enabled")
+        return
+    warnings = update_patch.apply_custom_update(src, update_url, public_key, log)
+    for warning in warnings:
+        log(f"    ! {warning}")
+
+
 def _apply_gpu_texture_fix(src, log):
     # needed so tagged releases resolve flutter_gpu_texture_renderer
     for rel in ["flutter/pubspec.lock", "flutter/pubspec.yaml"]:
@@ -1372,6 +1403,8 @@ def apply(src_dir, platform, env, patches_dir, log=print):
         _apply_printer_port(src_dir, env, log)
     _apply_company(src_dir, env, platform, log)
     _apply_flags(src_dir, env, patches_dir, log)
+    _apply_app_version(src_dir, env, log)
+    _apply_self_hosted_update(src_dir, env, log)
     _apply_gpu_texture_fix(src_dir, log)
     _apply_urls(src_dir, env, log)
     _apply_theme_color(src_dir, env, log)

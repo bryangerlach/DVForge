@@ -516,6 +516,26 @@ Everything lives in **`configs/RustDesk.json`** — edit it in the GUI (recommen
 </details>
 
 <details>
+<summary><b>Self-hosted auto-updates (rustdesk-api)</b></summary>
+
+A build made for a **rustdesk-api** server can update itself from that server's
+`/api/version/latest` endpoint. rustdesk-api injects these fields automatically
+when it starts a build; they can also be set by hand.
+
+| Field | Meaning |
+|---|---|
+| `update_public_key` | Base64/hex ed25519 public key used to verify `rustdesk-update.json`. Injecting it also disables the "hide update notice" tweak so the client keeps checking. |
+| `update_url` | Explicit update check URL. Blank falls back to `downloadLink` + `/api/version/latest`. |
+| `app_version` | Version embedded in `Cargo.toml` / `Cargo.lock` (e.g. `1.5.1+016`). rustdesk-api injects it per build so update ordering works and a freshly updated client does not re-offer the same build. |
+
+Signed update metadata is available in **RustDesk 1.5.1 and newer**. On older
+tags DVForge logs a warning and leaves the client unchanged. The client also
+trusts the API server's host for both the release-id URL and artifact download
+(the same source patches rdgen applies).
+
+</details>
+
+<details>
 <summary><b>Signing (see the dedicated section)</b></summary>
 
 | Field | Meaning |
