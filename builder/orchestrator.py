@@ -76,7 +76,7 @@ VERSION_PROFILES = {
     },
     "1.5.1": {
         "vcpkg_commit": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
-        "label": "1.5.1 (latest)",
+        "label": "1.5.1",
         "git_ref": "1.5.1",
     },
     "master": {
@@ -181,6 +181,13 @@ def version_profiles():
             "vcpkg_commit": fallback_pin,
             "default": False,
         }
+    # "(latest)" marks the newest stable release across static + discovered
+    # tags, so a new GitHub release relabels itself without an edit here.
+    latest = max((v for v in entries
+                  if _parse_version(v) and "(pre)" not in entries[v]["label"]),
+                 key=_parse_version, default=None)
+    if latest:
+        entries[latest]["label"] += " (latest)"
     return [entries[k] for k in sorted(entries, key=_version_sort_key,
                                        reverse=True)]
 
@@ -2344,6 +2351,29 @@ class Build:
             reasons.append(f"exe name changed ({have} -> {want})")
         if bad_prefix:
             reasons.append(f"CMAKE_INSTALL_PREFIX={prefix} needs admin")
+        # A wiped or interrupted build can leave ephemeral half-populated:
+        # Flutter stamps it as done, so cpp_client_wrapper is never re-copied
+        # and MSBuild fails with C1083 on core_implementations.cc et al.
+        # Issue #34: farm nodes hit this deterministically because workspace
+        # reuse keeps the half-populated ephemeral across jobs. Check every
+        # generated file MSBuild compiles, not just the first one.
+        ephemeral = os.path.join(self.src_dir, "flutter", "windows",
+                                 "flutter", "ephemeral")
+        if os.path.isdir(ephemeral):
+            required = (
+                os.path.join("cpp_client_wrapper", "core_implementations.cc"),
+                os.path.join("cpp_client_wrapper", "standard_codec.cc"),
+                os.path.join("cpp_client_wrapper", "plugin_registrar.cc"),
+                os.path.join("cpp_client_wrapper", "flutter_engine.cc"),
+                os.path.join("cpp_client_wrapper", "flutter_view_controller.cc"),
+                "flutter_windows.dll",
+            )
+            missing = [name for name in required
+                       if not os.path.isfile(os.path.join(ephemeral, name))]
+            if missing:
+                reasons.append(
+                    "ephemeral incomplete ("
+                    + ", ".join(os.path.basename(m) for m in missing) + ")")
         if not reasons:
             if have:
                 self.log(f"  · flutter windows cache matches BINARY_NAME={want}")
@@ -2356,8 +2386,6 @@ class Build:
         except Exception as e:
             self.log(f"  ! could not clear flutter windows cache: {e}")
         # Ephemeral plugin files were generated against the old target too.
-        ephemeral = os.path.join(self.src_dir, "flutter", "windows",
-                                 "flutter", "ephemeral")
         if os.path.isdir(ephemeral):
             try:
                 _force_rmtree(ephemeral)
@@ -3132,7 +3160,8 @@ class Build:
         self._vcpkg_publish_triplet(root, triplet, package_dir)
 
     def _patch_android_deps_script(self, path, host_tag):
-        """1.4.9 build_android_deps.sh hardcodes linux-x86_64 and GNU readlink -f."""
+        """1.4.9 build_android_deps.sh hardcodes linux-x86_64 and GNU readlink -f.
+        1.5.3+ braces the variables (${VCPKG_ROOT}, ${SCRIPTDIR}); match both forms."""
         if self.dry_run or not os.path.isfile(path) or not host_tag:
             return
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -3140,14 +3169,17 @@ class Build:
         orig = text
         if 'DVFORGE_VCPKG_INSTALL_ROOT' not in text:
             text, count = re.subn(
-                r'--x-install-root="\$VCPKG_ROOT/installed"',
-                '--x-install-root="${DVFORGE_VCPKG_INSTALL_ROOT:-$VCPKG_ROOT/installed}"',
+                r'--x-install-root="(?:\$\{VCPKG_ROOT\}|\$VCPKG_ROOT)/installed"',
+                '--x-install-root="${DVFORGE_VCPKG_INSTALL_ROOT:-${VCPKG_ROOT}/installed}"',
                 text, count=1)
             if not count:
                 raise RuntimeError("Cannot isolate Android dependencies: unknown vcpkg install command")
         # Keep arm-neon's package name and status consistent. Publish the alias in Python.
-        text = re.sub(r'if \[ -d "\$VCPKG_ROOT/installed/arm-neon-android" \]; then.*?\nfi',
-                      '# DVForge publishes arm-android without renaming package contents.',
+        # 1.4.9 closes the block with an unindented fi; 1.5.3+ nests it inside an
+        # ANDROID_ABI if (indented fi) — stop at the first fi line so the enclosing
+        # if keeps its own fi, and keep a `:` so its body is never comment-only.
+        text = re.sub(r'if \[ -d "(?:\$\{VCPKG_ROOT\}|\$VCPKG_ROOT)/installed/arm-neon-android" \]; then.*?\n[ \t]*fi',
+                      '# DVForge publishes arm-android without renaming package contents.\n\t:',
                       text, flags=re.DOTALL)
         text, n_tag = re.subn(
             r'HOST_TAG="[^"]*"', f'HOST_TAG="{host_tag}"', text, count=1)
@@ -3155,7 +3187,7 @@ class Build:
             portable = 'SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"'
             text2, n_rl = re.subn(
                 r'SCRIPTDIR="\$\(readlink -f "\$0"\)"\s*\n'
-                r'SCRIPTDIR="\$\(dirname "\$SCRIPTDIR"\)"',
+                r'SCRIPTDIR="\$\(dirname "(?:\$\{SCRIPTDIR\}|\$SCRIPTDIR)"\)"',
                 portable, text, count=1)
             if n_rl:
                 text = text2
@@ -3163,7 +3195,7 @@ class Build:
                 text = text.replace(
                     'SCRIPTDIR="$(readlink -f "$0")"', portable, 1)
                 text, _ = re.subn(
-                    r'\nSCRIPTDIR="\$\(dirname "\$SCRIPTDIR"\)"',
+                    r'\nSCRIPTDIR="\$\(dirname "(?:\$\{SCRIPTDIR\}|\$SCRIPTDIR)"\)"',
                     "\n# dirname skipped; SCRIPTDIR is already the script dir",
                     text, count=1)
         if text != orig:

@@ -42,7 +42,28 @@ from urllib.parse import parse_qs, unquote, urlparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 PUBLIC = os.path.join(HERE, "public")
 REPO_ROOT = os.path.dirname(HERE)
-WEB = os.path.join(REPO_ROOT, "web")
+
+
+def _repo_dir(name, env_var):
+    """Find a DVForge repo directory in a checkout or in the farm image.
+
+    A checkout has web/ next to farm/; the Docker image copies web/ next to
+    queue.py instead. DVFORGE_WEB-style env vars win, then the checkout layout,
+    then the image layout.
+    """
+    candidates = []
+    override = (os.environ.get(env_var) or "").strip()
+    if override:
+        candidates.append(override)
+    candidates.append(os.path.join(REPO_ROOT, name))
+    candidates.append(os.path.join(HERE, name))
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[0]
+
+
+WEB = _repo_dir("web", "DVFORGE_WEB")
 FARM = os.environ.get("DVFORGE_FARM", HERE)
 TOKEN = os.environ.get("DVFORGE_FARM_TOKEN", "").strip()
 INBOX = os.path.join(FARM, "inbox")
@@ -52,8 +73,9 @@ RUNNING = os.path.join(FARM, "running")
 SAFE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 
 # The config page reuses web/style.css and web/advanced-keys.js, and the
-# preview endpoint imports builder.config_gen. Running queue.py from a DVForge
-# checkout is enough; sys.path[0] is farm/, so add the repo root explicitly.
+# preview endpoint imports builder.config_gen. In a checkout those live under
+# the repo root (sys.path[0] is farm/, so add it); in the farm image they sit
+# next to queue.py, which Python already searches.
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -809,6 +831,31 @@ def _merge_progress_workers():
             WORKERS[worker] = rec
 
 
+# Fallback list for the request form until a version-aware worker registers
+# (workers report their RustDesk versions from the local DVForge /api/versions).
+STATIC_VERSIONS = ["1.5.1", "1.5.0", "1.4.9", "master"]
+
+
+def available_versions():
+    """RustDesk versions requestable on this farm: the union of what workers
+    reported, newest release first, branch refs last; static list when no
+    worker has reported versions (e.g. an outdated worker fleet)."""
+    seen = set()
+    with _LOCK:
+        for rec in WORKERS.values():
+            seen.update(v for v in (rec.get("versions") or []) if v)
+    if not seen:
+        seen = set(STATIC_VERSIONS)
+
+    def key(v):
+        m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", v.strip())
+        return tuple(int(p) for p in m.groups()) if m else (0, 0, 0)
+
+    releases = sorted((v for v in seen if key(v)), key=key, reverse=True)
+    branches = sorted(v for v in seen if not key(v))
+    return releases + branches
+
+
 def farm_stats():
     """Public snapshot — no job ids, no config, no secrets."""
     _merge_progress_workers()
@@ -1073,12 +1120,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, health_stats())
         if path == "/stats":
             return self._send(200, farm_stats())
+        if path == "/versions":
+            return self._send(200, {"versions": available_versions()})
         if path in ("/config", "/config.html"):
             page = config_page_html()
             if not page:
                 return self._send(503, {
                     "error": "config page needs the DVForge web/ directory "
-                             "next to farm/ (run queue.py from a DVForge checkout)"})
+                             "next to farm/ (run queue.py from a DVForge checkout, "
+                             "or build the image from the repo root)"})
             return self._send_page(page)
         if path.startswith("/config-assets/"):
             name = unquote(path.split("/", 2)[-1])
